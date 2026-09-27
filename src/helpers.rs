@@ -1,9 +1,9 @@
 use crate::{
+    constants::{U8_LEN, U32_LEN, U64_LEN},
     errors::{
         CorruptionType::{self, TruncatedRecord},
         CrcType, Result,
     },
-    lsm::{Hlc, U64_LEN},
 };
 use crc::{CRC_32_ISO_HDLC, Crc, Digest};
 use xxhash_rust::xxh3::xxh3_128;
@@ -190,6 +190,22 @@ pub fn create_new_data_file(dir: &Path, hlc: u64) -> io::Result<(File, PathBuf)>
 pub fn read_u64(buffer: &[u8], start_offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(
         read_range(buffer, start_offset, start_offset + U64_LEN)?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+pub fn read_u32(buffer: &[u8], start_offset: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        read_range(buffer, start_offset, start_offset + U32_LEN)?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+pub fn read_u8(buffer: &[u8], start_offset: usize) -> Result<u8> {
+    Ok(u8::from_le_bytes(
+        read_range(buffer, start_offset, start_offset + U8_LEN)?
             .try_into()
             .unwrap(),
     ))

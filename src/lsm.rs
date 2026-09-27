@@ -14,81 +14,35 @@ use std::thread::spawn;
 use std::time::{Duration, Instant};
 use std::{format, unreachable};
 
-use crate::compact::{CompactionJob, CompactionManager, CompactionSstSlice};
-use crate::errors::CorruptionType::{Other, SstLevelMalformed};
-use crate::errors::{
-    CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
+use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
+use crate::constants::{
+    BLOOM_BITS_PER_KEY, BLOOM_WORD_BITS, CRC_LEN, DATA_BLOCK, DATA_BLOCK_MAX_BYTES_SIZE,
+    FOOTER_BLOOM_LEN_START, FOOTER_FIXED_LEN, FOOTER_LEN, FOOTER_LEVEL_START,
+    FOOTER_MAX_KEY_LEN_START, FOOTER_MIN_KEY_LEN_START, FOOTER_SPARSE_LEN_START,
+    FOOTER_SPARSE_OFFSET_START, KEY_MAX_BYTES_SIZE, MASK_FOR_COUNTER, MASK_FOR_TSTAMP,
+    MAX_FLUSH_ATTEMPTS, MAX_FROZEN_MEMTABLES_LIMIT, MAX_MEMTABLE_THRESHOLD, MAX_SST_SIZE,
+    MEMTABLE_THRESHOLD, NUM_OF_BITS_FOR_COUNTER, NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION,
+    RECORD_HEADER_LEN, RECORD_KSZ_OFFSET, RECORD_TOMBSTONE_OFFSET, RECORD_VSZ_OFFSET, SST_EXT,
+    SST_LEVEL_COUNT, TAG_DELETION, TAG_INSERTION, TAG_LEN, TMP_EXT, TOMBSTONE_DELETED,
+    TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN, VALUE_MAX_BYTES_SIZE, WAL_EXT,
 };
-use crate::helpers::{CRC32, get_hlc_from_valid_pathbuf, read_u64};
+
+use crate::errors::CorruptionType::{Other, SstLevelMalformed};
+
+use crate::errors::{
+    CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, InvalidOptions,
+    Result,
+};
+use crate::helpers::{CRC32, get_hlc_from_valid_pathbuf, read_u8, read_u64};
 use crate::helpers::{
-    NUM_HASHES, check_crc, create_new_data_file, find_max_hlc_between_files,
-    get_hashed_key_positions, new_timestamp, read_exact_or_truncated, read_range,
+    NUM_HASHES, check_crc, create_new_data_file, get_hashed_key_positions, new_timestamp,
+    read_exact_or_truncated, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 use crate::lsm::SyncConfig::{Always, Every};
 use crate::manifest::{Manifest, ManifestEdit};
 
 use std::cmp::{Ordering as CmpOrdering, Reverse, max};
-
-// const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
-const MEMTABLE_THRESHOLD: u64 = 8 * 1024 * 1024; // SUBJECT TO CHANGE
-// this means L0 sstables are 8 mb, so we usually compact all L0 sstablse with all L1 sstables to a single L1 sstable.
-const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
-pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + 25 bytes for metadata(timestamp, ksz,vsz,tmbstone); // if we had a db_size of 8191, we could end up with adding a max val and max key
-// const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
-pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 100;
-
-pub const COMPACTION_READ_BUFFER_LEN: usize = 64 * 1024;
-const TAG_DELETION: u8 = 2;
-const TAG_INSERTION: u8 = 4;
-pub const SST_LEVEL_COUNT: usize = 4;
-pub const KEY_MAX_BYTES_SIZE: u64 = 16384;
-pub const VALUE_MAX_BYTES_SIZE: u64 = 131072;
-pub const NUM_OF_BITS_FOR_TSTAMP: u8 = 52;
-pub const NUM_OF_BITS_FOR_COUNTER: u8 = 12;
-pub const MASK_FOR_COUNTER: u64 = (u64::MAX) >> NUM_OF_BITS_FOR_TSTAMP; // 4096
-pub const MASK_FOR_TSTAMP: u64 = (u64::MAX) << NUM_OF_BITS_FOR_COUNTER;
-pub const NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION: usize = 10;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L1_COMPACTION: u64 = MAX_SST_SIZE * 10;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L2_COMPACTION: u64 = MAX_SST_SIZE * 100;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L3_COMPACTION: u64 = MAX_SST_SIZE * 1000;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L4_COMPACTION: u64 = MAX_SST_SIZE * 10000;
-pub const DEFAULT_DATA_DIR: &str = "data";
-pub const MAX_FLUSH_ATTEMPTS: u8 = 5;
-pub const U64_LEN: usize = size_of::<u64>(); // 8
-pub const TOMBSTONE_LEN: usize = 1;
-pub const RECORD_KSZ_OFFSET: usize = U64_LEN; // 8
-pub const RECORD_VSZ_OFFSET: usize = 2 * U64_LEN; // 16
-pub const RECORD_TOMBSTONE_OFFSET: usize = 3 * U64_LEN; // 24
-pub const RECORD_HEADER_LEN: usize = 3 * U64_LEN + TOMBSTONE_LEN; // 25
-
-pub const TOMBSTONE_DELETED: u8 = 0xFF;
-pub const TOMBSTONE_LIVE: u8 = 0x00;
-
-pub const BLOOM_BITS_PER_KEY: usize = 10;
-
-pub const CRC_LEN: usize = 4;
-pub const LEVEL_LEN: usize = 1;
-pub const TAG_LEN: usize = 1;
-
-pub const LEVELS: usize = 4;
-
-// below is to read footer from
-pub const FOOTER_SPARSE_OFFSET_START: usize = 0;
-pub const FOOTER_SPARSE_LEN_START: usize = FOOTER_SPARSE_OFFSET_START + U64_LEN; // 8
-pub const FOOTER_BLOOM_LEN_START: usize = FOOTER_SPARSE_LEN_START + U64_LEN; // 16
-pub const FOOTER_MIN_KEY_LEN_START: usize = FOOTER_BLOOM_LEN_START + U64_LEN; // 24
-pub const FOOTER_MAX_KEY_LEN_START: usize = FOOTER_MIN_KEY_LEN_START + U64_LEN; // 32
-pub const FOOTER_LEVEL_START: usize = FOOTER_MAX_KEY_LEN_START + U64_LEN; // 40
-pub const FOOTER_FIXED_LEN: usize = FOOTER_LEVEL_START + LEVEL_LEN; // 41
-
-pub const FOOTER_SPARSE_CRC_START: usize = FOOTER_FIXED_LEN; // 41
-pub const FOOTER_BLOOM_CRC_START: usize = FOOTER_SPARSE_CRC_START + CRC_LEN; // 45
-pub const FOOTER_MIN_MAX_CRC_START: usize = FOOTER_BLOOM_CRC_START + CRC_LEN; // 49
-pub const FOOTER_FIELDS_CRC_START: usize = FOOTER_MIN_MAX_CRC_START + CRC_LEN; // 53
-pub const FOOTER_LEN: usize = FOOTER_FIELDS_CRC_START + CRC_LEN;
-
-pub const BLOOM_WORD_BITS: usize = 64;
 
 // WAL config for flush
 
@@ -466,11 +420,7 @@ impl SSTable {
             CrcType::SstFooterMetadata,
         )?;
 
-        let level = u8::from_le_bytes(
-            read_range(&footer, FOOTER_LEVEL_START, FOOTER_FIXED_LEN)?
-                .try_into()
-                .unwrap(),
-        );
+        let level = read_u8(&footer, FOOTER_LEVEL_START)?;
 
         if level as usize >= SST_LEVEL_COUNT {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
@@ -1435,11 +1385,66 @@ struct FrozenMemtableInstance {
     flush_attempts: u8,
 }
 // TODO:
+
+#[derive(Clone, Copy)]
+pub enum WalRecoveryMode {
+    TolerateTornTail, // drop a torn tail in the newest WAL; any other damage is an error
+    PointInTime, // stop at the first damage, skip every newer WAL, open at that moment(loses data but recovers)
+    AbsoluteConsistency, // any damage at all, even a torn tail, is an error
+}
+pub struct KVEngineOptions {
+    sync: SyncConfig,
+    wal_recovery_mode: WalRecoveryMode,
+    memtable_threshold: u64,
+    max_flush_retries: u8,
+    max_frozen_memtables: u8, // whem max is reached, pause writes until we finish at least 1
+}
+impl Default for KVEngineOptions {
+    fn default() -> Self {
+        Self {
+            sync: SyncConfig::Always,
+            wal_recovery_mode: WalRecoveryMode::PointInTime,
+            memtable_threshold: 8 * 1024 * 1024,
+            max_flush_retries: 5,
+            max_frozen_memtables: 4,
+        }
+    }
+}
+
+impl KVEngineOptions {
+    fn validate(&self) -> Result<()> {
+        let min = VALUE_MAX_BYTES_SIZE + KEY_MAX_BYTES_SIZE + RECORD_HEADER_LEN as u64;
+        if !(min..=MAX_MEMTABLE_THRESHOLD).contains(&self.memtable_threshold) {
+            return Err(InvalidOptions::MemtableThresholdOutOfRange {
+                min,
+                max: MAX_MEMTABLE_THRESHOLD,
+                found: self.memtable_threshold,
+            }
+            .into());
+        }
+        if !(1..=MAX_FROZEN_MEMTABLES_LIMIT).contains(&self.max_frozen_memtables) {
+            return Err(InvalidOptions::MaxFrozenMemtablesOutOfRange {
+                min: 1,
+                max: MAX_FROZEN_MEMTABLES_LIMIT,
+                found: self.max_frozen_memtables,
+            }
+            .into());
+        }
+
+        if let Every(ms) = self.sync
+            && ms == 0
+        {
+            return Err(InvalidOptions::SyncIntervalIsZero.into());
+        }
+
+        Ok(())
+    }
+}
+
 struct KVEngine {
     // node_id: have a unique ID here
     data_directory: PathBuf, // data_directory now holds all .sst and .wal files
     sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>, // [vec0(l0), vec1(l1)] .. etc/
-    sync_config: SyncConfig,
     wal: WAL,
     memtable: AVL,
     frozen_memtables: BTreeMap<u64, FrozenMemtableInstance>, // ordered. id(hlc) -> mem
@@ -1449,6 +1454,7 @@ struct KVEngine {
     compaction_manager: CompactionManager,
     db_failed: Option<String>, //
     manifest: Manifest,
+    options: KVEngineOptions,
 }
 
 pub struct Hlc {
@@ -1516,8 +1522,11 @@ impl Hlc {
 }
 
 impl KVEngine {
-    fn open(dir_name: &Path, sync_config: SyncConfig) -> Result<KVEngine> {
+    fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
+
+        //TODO: make sure we use options now
+        options.validate()?;
 
         let mut sstables: [Vec<SSTable>; SST_LEVEL_COUNT] = [const { Vec::new() }; SST_LEVEL_COUNT];
 
@@ -1536,17 +1545,17 @@ impl KVEngine {
             }
 
             match path.extension().and_then(|x| x.to_str()) {
-                Some("sst") => {
+                Some(SST_EXT) => {
                     if let Ok(id) = get_hlc_from_valid_pathbuf(&path) {
                         sst_vec.push((id, path));
                     }
                 }
-                Some("wal") => {
+                Some(WAL_EXT) => {
                     if let Ok(id) = get_hlc_from_valid_pathbuf(&path) {
                         wal_vec.push((id, path));
                     }
                 }
-                Some("tmp") => {
+                Some(TMP_EXT) => {
                     // incomplete manifest
                     let _ = remove_file(path);
                 }
@@ -1594,13 +1603,12 @@ impl KVEngine {
         let hlc = Hlc::new();
 
         hlc.recover_to(max_hlc);
-        let wal = WAL::new(MEMTABLE_THRESHOLD, sync_config, &path, hlc.tick())?;
+        let wal = WAL::new(MEMTABLE_THRESHOLD, options.sync, &path, hlc.tick())?;
         // IMPORTANT: The new wal is created after we check the actual directory for wal files.
         // This is important because we do not want to call retrieve_wal_records() on the new empty wal
 
         let mut self_instance = Self {
             data_directory: path,
-            sync_config,
             memtable,
             sstables: None,
             manifest,
@@ -1611,6 +1619,7 @@ impl KVEngine {
             hlc: Arc::new(hlc),
             compaction_manager: CompactionManager::new(),
             db_failed: None,
+            options,
         };
 
         for (_, path) in live_ssts {
@@ -1666,7 +1675,8 @@ impl KVEngine {
             let _ = remove_file(path);
         }
 
-        wals_to_replay.sort_by_key(|(id, path)| *id);
+        wals_to_replay.sort_by_key(|(id, _)| *id);
+
         for (id, path) in wals_to_replay {
             // wal populates this and we flush it to disk as an .sst
 
@@ -1679,7 +1689,7 @@ impl KVEngine {
                     self_instance.manifest.edit_and_append(&ManifestEdit {
                         new_files: vec![(0, ss.id)],
                         deleted_files: vec![],
-                        min_live_wal: Some(id + 1), // fix
+                        min_live_wal: Some(id + 1),
                     })?;
                     if ss.level < SST_LEVEL_COUNT as u8 {
                         sstables[ss.level as usize].push(ss);
@@ -1873,7 +1883,7 @@ impl KVEngine {
         self.search_for_kv_in_sstables(key) // if we get here, 
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if let Some(err_msg) = &self.db_failed {
             return Err(DbError::ReadOnly(err_msg.to_string())); // maybe put the message in the Error
         }
@@ -1883,7 +1893,7 @@ impl KVEngine {
         if (key.len() as u64 + value.len() as u64 + self.memtable.size_in_bytes)
             > self.memtable.threshold
         {
-            self.rotate_memtable_and_wal()?;
+            self.rotate_memtable_and_wal()?; // if it returns DbError::WritesStalled, have caller handle(maybe retry again in a couple ms)
         }
 
         let hlc = self.hlc.tick();
@@ -1938,11 +1948,24 @@ impl KVEngine {
     }
 
     fn rotate_memtable_and_wal(&mut self) -> Result<()> {
+        let max = self.options.max_frozen_memtables as usize;
+        if self.frozen_memtables.len() >= max {
+            // block writes for a little
+            while let Ok(msg) = self.flushing_manager.rx.try_recv() {
+                self.handle_flushing_message(msg)?;
+            }
+            self.retire_frozen_memtables()?;
+            if self.frozen_memtables.len() >= max {
+                return Err(DbError::WritesStalled {
+                    frozen_memtables: self.frozen_memtables.len(),
+                });
+            }
+        }
         let old_wal = std::mem::replace(
             &mut self.wal,
             WAL::new(
                 MEMTABLE_THRESHOLD,
-                self.sync_config,
+                self.options.sync,
                 &self.data_directory,
                 self.hlc.tick(),
             )?,
@@ -1958,30 +1981,12 @@ impl KVEngine {
 
         let tick = self.hlc.tick();
 
-        // WHEN MAIN RECEIVES MESSAGE ABOUT A SUCCESSFUL SST SYNCED, USE SST ID TO REMOVE IT FROM FROZEN COLLECTION
-        // GET METHOD SHOULD FIRST CHECK ACTIVE MEMTABLE, THEN THE COLLECTION OF FROZEN FROM MOST RECENT TO LAST
-        // order: frozen1 -> tick123, frozen2->tick240, frozen3->tick500
-        // most recent is tick500 so the get method should go through them in reverse
-
-        // PROBLEM ^:
-        // if a flush that contains more recent data finished before older flushes ->
-        // it sits as a sst whereas the get() method checks frozen wals first but the newer data sits behind as a sst, serving stale data
-        // figure out a way to not let this happen
-        // If we keep every frozen memtable in memory, thats a lot of space amplification
-        // also depending on load, we could always have frozen AVLS in memory
-        // only remove frozen mem if its older than every other frozen mem ? so older memtables wait for more recent ones
-        // Node(id: 145, AVL, state: unifinished), Node(id: 241, AVL, state: unfinished), Node(id: 13,AVL, state: unfinished), Node(id: 600, AVL, state: finished(is already an sst on disk))
-        // if Node.600 gets removed from memory, we search the other memtables before the SSTS and serve STALE data
-        // fix: on poll, when a Node.id is returned, mark it finished, then have another function check if there is any OLDER data on memtable memory
-        // if yes, we have to wait for all of those to finish to retire Node.600
-        // on poll, run a while loop that gets the first element(dont pop yet), checks if its finished, if yes retire(first element means OLDEST by id) so its okay to retire
-        // also make sure to mark the mem returned as finished before this
         let frozen_mems = &mut self.frozen_memtables;
         frozen_mems.insert(
             tick,
             FrozenMemtableInstance {
-                wal_id, // remove after its done
                 sstable: None,
+                wal_id, // remove after its done
                 memtable: Arc::clone(&frozen),
                 id: tick,
                 flush_attempts: 0,
@@ -2004,7 +2009,7 @@ impl KVEngine {
 
     fn does_overlap(sstable: &SSTable, min_k: &[u8], max_k: &[u8]) -> bool {
         if let Some((other_ss_min_k, other_ss_max_k)) = sstable.min_max_keys.as_ref() {
-            return (other_ss_min_k.as_slice() <= max_k && min_k <= other_ss_max_k.as_slice());
+            return other_ss_min_k.as_slice() <= max_k && min_k <= other_ss_max_k.as_slice();
         }
         false
     }
@@ -2037,7 +2042,7 @@ impl KVEngine {
 
     fn select_files_for_l0_compaction(
         &self,
-        levels: &RwLockReadGuard<'_, [Vec<SSTable>; LEVELS]>,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; SST_LEVEL_COUNT]>,
     ) -> Result<Option<Vec<CompactionSstSlice>>> {
         let mut vec_of_overlapping_pathbufs: Vec<&SSTable> = Vec::new();
         let ssts_in_level = &levels[0];
@@ -2072,7 +2077,7 @@ impl KVEngine {
 
     fn select_level_for_compaction(
         &self,
-        levels: &RwLockReadGuard<'_, [Vec<SSTable>; LEVELS]>,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; SST_LEVEL_COUNT]>,
     ) -> Option<(f64, u8)> {
         let mut best_ratio_candidate: Option<(f64, u8)> = None; // first number is ratio, second is what level
 
@@ -2119,7 +2124,7 @@ impl KVEngine {
 
     fn select_files_for_compaction(
         &self,
-        levels: &RwLockReadGuard<'_, [Vec<SSTable>; LEVELS]>,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; SST_LEVEL_COUNT]>,
         level: u8,
     ) -> Result<Option<Vec<CompactionSstSlice>>> {
         let mut best_candidate: Option<(u64, &SSTable)> = None; // will be made into a struct later
@@ -2224,11 +2229,6 @@ impl KVEngine {
         Ok(Some(true))
     }
 
-    // need a function that checks whether there are any messages from the flushing thread
-    // or from compaction
-    // if yes, we push the new sstables and change state
-    // if no, its just a simple check -> skip
-
     fn add_sstable_to_l0(&mut self, sstable: SSTable) {
         if let Some(levels) = &self.sstables {
             let mut levels = levels.write().unwrap();
@@ -2236,48 +2236,43 @@ impl KVEngine {
             levels[0].sort_by_key(|s| Reverse(s.id));
         }
     }
-    fn maintenance(&mut self) -> Result<()> {
-        //
-        // check flushing thread first
 
-        if let Some(error_str) = &self.db_failed {
-            return Err(DbError::ReadOnly(error_str.to_string()));
-        }
-        let mut should_check_for_compaction = false;
-
-        if let Ok(msg) = self.flushing_manager.rx.try_recv() {
-            match msg {
-                FlushingThreadResponse::Success { id, sstable } => {
-                    if let Some(frozen_instance) = self.frozen_memtables.get_mut(&id) {
-                        frozen_instance.sstable = Some(sstable);
-                    }
+    fn handle_flushing_message(&mut self, msg: FlushingThreadResponse) -> Result<()> {
+        match msg {
+            FlushingThreadResponse::Success { id, sstable } => {
+                if let Some(frozen_instance) = self.frozen_memtables.get_mut(&id) {
+                    frozen_instance.sstable = Some(sstable);
                 }
-                FlushingThreadResponse::Error { id, error } => {
-                    if let Some(instance) = self.frozen_memtables.get_mut(&id) {
-                        instance.flush_attempts += 1;
-                        if instance.flush_attempts <= MAX_FLUSH_ATTEMPTS {
-                            let _ = fs::remove_file(self.data_directory.join(format!("{id}.sst")));
-                            self.flushing_manager.background_flush_memtable(
-                                FrozenMemtableInstance {
-                                    memtable: instance.memtable.clone(),
-                                    sstable: instance.sstable.take(),
-                                    id: instance.id,
-                                    wal_id: instance.wal_id,
-                                    flush_attempts: instance.flush_attempts,
-                                },
-                                self.data_directory.clone(),
-                            )?;
-                        } else {
-                            self.fail(format!("memtable {id} failed to flush after {MAX_FLUSH_ATTEMPTS} attempts. \
+            }
+            FlushingThreadResponse::Error { id, error } => {
+                if let Some(instance) = self.frozen_memtables.get_mut(&id) {
+                    instance.flush_attempts += 1;
+                    if instance.flush_attempts <= self.options.max_flush_retries {
+                        let _ = fs::remove_file(self.data_directory.join(format!("{id}.sst")));
+                        self.flushing_manager.background_flush_memtable(
+                            FrozenMemtableInstance {
+                                memtable: instance.memtable.clone(),
+                                sstable: instance.sstable.take(),
+                                id: instance.id,
+                                wal_id: instance.wal_id,
+                                flush_attempts: instance.flush_attempts,
+                            },
+                            self.data_directory.clone(),
+                        )?;
+                    } else {
+                        self.fail(format!("memtable {id} failed to flush after {MAX_FLUSH_ATTEMPTS} attempts. \
                                             No later memtable can retire behind it, so memory will keep growing. \
                                             Its data is still in its WAL and will be recovered on reopen: {error}"));
-                            return Err(error);
-                        }
+                        return Err(error);
                     }
-                } // use self.fail here but retry first
-            }
+                }
+            } // use self.fail here but retry first
         };
+        Ok(())
+    }
 
+    fn retire_frozen_memtables(&mut self) -> Result<bool> {
+        let mut should_check_for_compaction = false;
         while let Some(first) = self.frozen_memtables.first_entry() {
             let Some(sst_id) = first.get().sstable.as_ref().map(|sst| sst.id) else {
                 // sstable there = finished
@@ -2305,66 +2300,87 @@ impl KVEngine {
             let _ = fs::remove_file(self.data_directory.join(format!("{}.wal", wal_id)));
         }
 
-        if let Some(result) = self.compaction_manager.poll() {
-            match result {
-                Ok(compaction_outcome) => {
-                    let edit = ManifestEdit {
-                        new_files: compaction_outcome
-                            .final_sst_files
-                            .iter()
-                            .map(|x| (compaction_outcome.level_for_output_sst, *x))
-                            .collect(),
-                        deleted_files: compaction_outcome.consumed_sst_files.clone(),
-                        min_live_wal: None,
-                    };
+        Ok(should_check_for_compaction)
+    }
 
-                    let mut outputs = Vec::with_capacity(compaction_outcome.final_sst_files.len());
-                    for file_id in compaction_outcome.final_sst_files {
-                        // fs::rename(tmp, &final_path)?;
-                        outputs.push(SSTable::load(
-                            &self.data_directory.join(format!("{file_id}.sst")),
-                        )?);
-                    }
-                    File::open(&self.data_directory)?.sync_all()?;
-                    if let Err(e) = self.manifest.edit_and_append(&edit) {
-                        self.fail(format!( "manifest commit failed for the compaction into L{}, so its outputs cannot be published. \
+    fn finalize_compaction(&mut self, result: Result<CompactionOutcome>) -> Result<bool> {
+        let mut should_check_for_compaction = false;
+        match result {
+            Ok(compaction_outcome) => {
+                let edit = ManifestEdit {
+                    new_files: compaction_outcome
+                        .final_sst_files
+                        .iter()
+                        .map(|x| (compaction_outcome.level_for_output_sst, *x))
+                        .collect(),
+                    deleted_files: compaction_outcome.consumed_sst_files.clone(),
+                    min_live_wal: None,
+                };
+
+                let mut outputs = Vec::with_capacity(compaction_outcome.final_sst_files.len());
+                for file_id in compaction_outcome.final_sst_files {
+                    // fs::rename(tmp, &final_path)?;
+                    outputs.push(SSTable::load(
+                        &self.data_directory.join(format!("{file_id}.sst")),
+                    )?);
+                }
+                File::open(&self.data_directory)?.sync_all()?;
+                if let Err(e) = self.manifest.edit_and_append(&edit) {
+                    self.fail(format!( "manifest commit failed for the compaction into L{}, so its outputs cannot be published. \
                         The inputs are still live and the outputs are cleaned up on reopen: {e}", compaction_outcome.level_for_output_sst ));
-                        return Err(e);
-                    }
-
-                    if let Some(levels) = &self.sstables {
-                        let mut levels = levels.write().unwrap();
-                        for level in levels.iter_mut() {
-                            level.retain(|ss| !edit.deleted_files.contains(&(ss.level, ss.id)));
-                        }
-
-                        for sst in outputs {
-                            levels[sst.level as usize].push(sst);
-                        }
-
-                        for level in levels.iter_mut() {
-                            level.sort_by_key(|s| Reverse(s.id));
-                        }
-                    }
-
-                    for (_, sst_id) in compaction_outcome.consumed_sst_files {
-                        let _ = remove_file(self.data_directory.join(format!("{sst_id}.sst")));
-                    }
-                    should_check_for_compaction = true;
-                }
-                Err(DbError::DataCorrupted(e)) => {
-                    // propagated to here by a compaction failure on a corrupt file. There could be more files that are actually corrupt
-                    // but this is what set it off.
-                    self.corrupted_files.insert(e.file_path.clone());
-                    self.fail(format!(
-        "compaction stopped on a corrupt input file; writes disabled, reads still served: {e}"
-    ));
-                    return Err(DbError::DataCorrupted(e));
-                }
-                Err(e) => {
                     return Err(e);
                 }
+
+                if let Some(levels) = &self.sstables {
+                    let mut levels = levels.write().unwrap();
+                    for level in levels.iter_mut() {
+                        level.retain(|ss| !edit.deleted_files.contains(&(ss.level, ss.id)));
+                    }
+
+                    for sst in outputs {
+                        levels[sst.level as usize].push(sst);
+                    }
+
+                    for level in levels.iter_mut() {
+                        level.sort_by_key(|s| Reverse(s.id));
+                    }
+                }
+                should_check_for_compaction = true;
+
+                for (_, sst_id) in compaction_outcome.consumed_sst_files {
+                    let _ = remove_file(self.data_directory.join(format!("{sst_id}.sst")));
+                }
+
+                Ok(should_check_for_compaction)
             }
+            Err(DbError::DataCorrupted(e)) => {
+                // propagated to here by a compaction failure on a corrupt file. There could be more files that are actually corrupt
+                // but this is what set it off.
+                self.corrupted_files.insert(e.file_path.clone());
+                self.fail(format!(
+        "compaction stopped on a corrupt input file; writes disabled, reads still served: {e}"
+    ));
+                Err(DbError::DataCorrupted(e))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn maintenance(&mut self) -> Result<()> {
+        //
+        // check flushing thread first
+
+        if let Some(error_str) = &self.db_failed {
+            return Err(DbError::ReadOnly(error_str.to_string()));
+        }
+
+        while let Ok(msg) = self.flushing_manager.rx.try_recv() {
+            self.handle_flushing_message(msg)?;
+        }
+
+        let mut should_check_for_compaction = self.retire_frozen_memtables()?; // true means we added to L0, successful retirement
+
+        if let Some(result) = self.compaction_manager.poll() {
+            should_check_for_compaction |= self.finalize_compaction(result)?; // overwriting the value
         }
 
         if should_check_for_compaction {

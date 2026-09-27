@@ -18,19 +18,19 @@ use std::{
 
 use crate::errors::CompactionErr::{self};
 
+use crate::constants::{
+    BLOOM_BITS_PER_KEY, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
+    FOOTER_FIXED_LEN, MAX_SST_SIZE, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
+};
 use crate::errors::CrcType;
 use crate::helpers::{
     CRC32, check_crc, check_key_value_record_does_not_exceed_max, create_new_data_file,
     get_positions_from_hashed_key, hash_key, read_exact_or_truncated,
 };
-use crate::lsm::{
-    AVL, BloomFilter, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
-    FOOTER_FIXED_LEN, Hlc, MAX_SST_SIZE, SparseIndex, SsTableDataBlock, TOMBSTONE_DELETED,
-    TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
-};
+use crate::lsm::{AVL, BloomFilter, Hlc, SparseIndex, SsTableDataBlock};
 use crate::{
+    constants::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE},
     errors::{DataCorruptedErr, DbError, Result},
-    lsm::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE},
 };
 
 //Comes from SSTable struct
@@ -496,7 +496,8 @@ impl CompactionJob {
 
         sst_finalizer.offset += full.bytes.get_ref().len() as u64; // length here is the start of sst_finalizer.sparse_index //
 
-        let mut bloom_filter = BloomFilter::new(sst_finalizer.hashed_keys.len() * 10);
+        let mut bloom_filter =
+            BloomFilter::new(sst_finalizer.hashed_keys.len() * BLOOM_BITS_PER_KEY);
         sst_finalizer.hashed_keys.iter().for_each(|h_key| {
             let positions = get_positions_from_hashed_key(*h_key, bloom_filter.num_bits as usize);
             bloom_filter.set_bits(positions);

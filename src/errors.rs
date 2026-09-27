@@ -5,7 +5,7 @@ use std::{
     io,
     num::ParseIntError,
     path::PathBuf,
-    write,
+    write, writeln,
 };
 
 #[derive(Debug)]
@@ -66,6 +66,18 @@ pub enum CorruptionType {
 }
 
 #[derive(Debug)]
+pub enum InvalidOptions {
+    MemtableThresholdOutOfRange { min: u64, max: u64, found: u64 },
+    MaxFrozenMemtablesOutOfRange { min: u8, max: u8, found: u8 },
+    SyncIntervalIsZero,
+}
+
+impl From<InvalidOptions> for DbError {
+    fn from(e: InvalidOptions) -> DbError {
+        DbError::InvalidOptions(e)
+    }
+}
+#[derive(Debug)]
 
 // TODO: DbError is the umbrella for th errors, later on group errors together, for example CompactionErr, FlushingErrs etc as well as have
 // generic errors for everythign
@@ -92,6 +104,8 @@ pub enum DbError {
     InvalidMemtableInput(InvalidMemtableInput),
     OutOfBoundsRead { start: u64, end: u64, len: u64 }, // TODO: extend this to be more elaborate
     ManifestError(String), // TODO: make more elaborate = different kinds of ManifestErrs
+    InvalidOptions(InvalidOptions),
+    WritesStalled { frozen_memtables: usize },
 }
 #[derive(Debug)]
 
@@ -319,6 +333,28 @@ impl fmt::Display for DbError {
             }
             Self::ReadOnly(s) => {
                 write!(f, "Database in read only mode. Err Msg: {}", s)
+            }
+            Self::InvalidOptions(opts) => match opts {
+                InvalidOptions::MaxFrozenMemtablesOutOfRange { min, max, found } => write!(
+                    f,
+                    "Invalid options: max_frozen_memtables must be between {min} and {max}. Found: {found}"
+                ),
+                InvalidOptions::SyncIntervalIsZero => write!(
+                    f,
+                    "Invalid options: SyncConfig::Every(0) would sync in a busy loop. Use SyncConfig::Always instead"
+                ),
+                InvalidOptions::MemtableThresholdOutOfRange { min, max, found } => write!(
+                    f,
+                    "Invalid options: memtable_threshold must be between {min} and {max} bytes \
+         (the minimum must fit one max size record). Found: {found}"
+                ),
+            },
+            Self::WritesStalled { frozen_memtables } => {
+                write!(
+                    f,
+                    "Writes to the database are stalled for the moment due to max of frozen_memtables reached. Frozen_memtables count: {}. Writes will continue when there is space available",
+                    frozen_memtables
+                )
             }
         }
     }

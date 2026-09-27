@@ -1,20 +1,19 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 
+use std::format;
 use std::path::Path;
 use std::{collections::BTreeSet, path::PathBuf};
-use std::{format, unimplemented};
 
+use crate::constants::{
+    LEVEL_LEN, MANIFEST_FILE_NAME, MANIFEST_LEN_PREFIX, MANIFEST_RECORD_OVERHEAD,
+    MANIFEST_TMP_FILE_NAME, MAX_MANIFEST_SIZE, TAG_ADD_FILE, TAG_DELETE_FILE, TAG_LEN,
+    TAG_MIN_LIVE_WAL, U64_LEN,
+};
 use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError};
-use crate::helpers::{CRC32, check_crc, read_range, read_u64};
-use crate::lsm::{LEVEL_LEN, TAG_LEN, U64_LEN};
-use crate::{errors::Result, lsm::SST_LEVEL_COUNT};
-pub const MAX_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
-pub const TAG_ADD_FILE: u8 = 1;
-pub const TAG_DELETE_FILE: u8 = 2;
-pub const TAG_MIN_LIVE_WAL: u8 = 3;
-pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
-pub const MANIFEST_TMP_FILE_NAME: &str = "MANIFEST.tmp";
+use crate::helpers::{CRC32, check_crc, read_range, read_u8, read_u32, read_u64};
+use crate::{constants::SST_LEVEL_COUNT, errors::Result};
+
 /*
 
 
@@ -67,7 +66,7 @@ impl ManifestState {
 
         while offset < bytes.len() {
             let byte_to_deserialize = &bytes[offset..];
-            if byte_to_deserialize.len() < 8 {
+            if byte_to_deserialize.len() < MANIFEST_LEN_PREFIX {
                 break; // 
             }
 
@@ -77,7 +76,7 @@ impl ManifestState {
                     "record length {length} is larger than the MAX_MANIFEST_SIZE"
                 )));
             }
-            if 12 + length > byte_to_deserialize.len() {
+            if MANIFEST_RECORD_OVERHEAD + length > byte_to_deserialize.len() {
                 break;
             }
 
@@ -89,7 +88,7 @@ impl ManifestState {
 
         Ok(starting_state)
     }
-    fn edit_state(&mut self, edit: &ValidatedEdit) -> () {
+    fn edit_state(&mut self, edit: &ValidatedEdit) {
         // should only be called when check_edit_is_compatible_with_state passes
 
         for (lvl, sst_id) in &edit.0.new_files {
@@ -294,7 +293,7 @@ impl Manifest {
 
         // get crc
         let crc32 = CRC32.compute_crc_data_block(&payload);
-        let mut record: Vec<u8> = Vec::with_capacity(payload.len() + 12); // 4 for crc, 8 for length
+        let mut record: Vec<u8> = Vec::with_capacity(payload.len() + MANIFEST_RECORD_OVERHEAD);
         record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         record.extend_from_slice(&payload);
         record.extend_from_slice(&crc32.to_le_bytes());
@@ -315,28 +314,29 @@ impl Manifest {
         let mut new_files: Vec<(u8, u64)> = Vec::new();
         let mut deleted_files: Vec<(u8, u64)> = Vec::new();
         let mut wal_id: Option<u64> = None;
-        let payload = read_range(bytes, 8, 8 + length as usize)?;
+        let payload = read_range(
+            bytes,
+            MANIFEST_LEN_PREFIX,
+            MANIFEST_LEN_PREFIX + length as usize,
+        )?;
         let crc_to_check = CRC32.compute_crc_data_block(payload);
-        let crc_in_file = u32::from_le_bytes(
-            read_range(
-                bytes,
-                (8 + length as usize) as usize,
-                (8 + length as usize) + 4,
-            )?
-            .try_into()
-            .unwrap(),
-        );
+        let crc_in_file = read_u32(bytes, MANIFEST_LEN_PREFIX + length as usize)?;
 
-        check_crc(crc_to_check, crc_in_file, 8, path, CrcType::ManifestRecord)?;
+        check_crc(
+            crc_to_check,
+            crc_in_file,
+            MANIFEST_LEN_PREFIX as u64, // where payload begins in case crc fails
+            path,
+            CrcType::ManifestRecord,
+        )?;
         let mut pos: usize = 0;
 
         while pos < payload.len() {
-            let tag = u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
+            let tag = read_u8(payload, pos)?;
             pos += TAG_LEN;
             match tag {
                 TAG_ADD_FILE => {
-                    let lvl =
-                        u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
+                    let lvl = read_u8(payload, pos)?;
                     pos += LEVEL_LEN;
                     let sst_id = read_u64(payload, pos)?;
 
@@ -344,8 +344,7 @@ impl Manifest {
                     new_files.push((lvl, sst_id));
                 }
                 TAG_DELETE_FILE => {
-                    let lvl =
-                        u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
+                    let lvl = read_u8(payload, pos)?;
                     pos += LEVEL_LEN;
                     let sst_id = read_u64(payload, pos)?;
                     pos += U64_LEN;
@@ -358,7 +357,7 @@ impl Manifest {
                 }
                 found => {
                     return Err(DbError::DataCorrupted(DataCorruptedErr {
-                        offset: 8 + pos as u64 - 1,
+                        offset: (MANIFEST_LEN_PREFIX + pos - TAG_LEN) as u64,
                         file_path: path.to_path_buf(),
                         reason: CorruptionType::RecordTypeCorrupted { found },
                     }));
@@ -372,7 +371,7 @@ impl Manifest {
                 deleted_files,
                 min_live_wal: wal_id,
             },
-            pos + 4 + 8, // for the crc and length
+            pos + MANIFEST_RECORD_OVERHEAD, // for the crc and length
         ))
     } // reads bytes of a record and returns a ManifestEdit, so on reboot, we call on each record to build ManifestState
 }
