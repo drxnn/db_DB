@@ -12,11 +12,8 @@ use crate::{
     },
     errors::{DbError, InvalidMemtableInput, Result},
     helpers::{CRC32, create_new_data_file, get_hashed_key_positions},
-    lsm::{
-        BloomFilter,
-        Lookup::{self, Absent, Deleted, Found},
-        SparseIndex, SsTableDataBlock,
-    },
+    lsm::Lookup::{self, Absent, Deleted, Found},
+    sstable::{BloomFilter, SparseIndex, SsTableDataBlock},
 };
 
 pub struct AVL {

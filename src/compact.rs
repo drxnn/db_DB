@@ -28,8 +28,8 @@ use crate::helpers::{
     get_positions_from_hashed_key, hash_key, read_exact_or_truncated,
 };
 use crate::hlc::Hlc;
-use crate::lsm::{BloomFilter, SparseIndex, SsTableDataBlock};
 use crate::memtable::AVL;
+use crate::sstable::{BloomFilter, SparseIndex, SsTableDataBlock};
 use crate::{
     constants::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE},
     errors::{DataCorruptedErr, DbError, Result},
