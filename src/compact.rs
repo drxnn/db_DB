@@ -27,7 +27,9 @@ use crate::helpers::{
     CRC32, check_crc, check_key_value_record_does_not_exceed_max, create_new_data_file,
     get_positions_from_hashed_key, hash_key, read_exact_or_truncated,
 };
-use crate::lsm::{AVL, BloomFilter, Hlc, SparseIndex, SsTableDataBlock};
+use crate::hlc::Hlc;
+use crate::lsm::{BloomFilter, SparseIndex, SsTableDataBlock};
+use crate::memtable::AVL;
 use crate::{
     constants::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE},
     errors::{DataCorruptedErr, DbError, Result},
@@ -393,6 +395,11 @@ impl CompactionManager {
             Ok(cmpt_outcome) => Some(cmpt_outcome),
             Err(e) => None, // what would be done here?
         }
+    }
+
+    pub fn wait_for_handle_finish(&mut self) -> Option<Result<CompactionOutcome>> {
+        let handle = self.running_job.take()?;
+        handle.join().ok()
     }
 }
 pub struct CompactionJob {

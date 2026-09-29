@@ -63,6 +63,10 @@ pub enum CorruptionType {
     }, // add value that was expected too, either 0xFF or 0x00
     TruncatedRecord, // TODO: Not a corruption necessarily
     SstLevelMalformed(usize),
+    FileTooSmall {
+        min_size: u64,
+        found: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -208,6 +212,13 @@ impl fmt::Display for CorruptionType {
                     f,
                     "SST level does not fall within accepted level bounds. Level is {}",
                     lvl
+                )
+            }
+            Self::FileTooSmall { min_size, found } => {
+                write!(
+                    f,
+                    "File too small to be valid. Minimum size: {} bytes. Found: {} bytes",
+                    min_size, found
                 )
             }
         }

@@ -1,7 +1,7 @@
 use std::os::unix::fs::FileExt;
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, OpenOptions, remove_file};
+use std::fs::{self, File, OpenOptions, remove_file, rename};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
-use std::thread::spawn;
+use std::thread::{JoinHandle, spawn};
 use std::time::{Duration, Instant};
-use std::{format, unreachable};
+use std::{format, todo, unreachable};
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
 use crate::constants::{
@@ -27,7 +27,7 @@ use crate::constants::{
     TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN, VALUE_MAX_BYTES_SIZE, WAL_EXT,
 };
 
-use crate::errors::CorruptionType::{Other, SstLevelMalformed};
+use crate::errors::CorruptionType::{CrcMismatch, Other, SstLevelMalformed, TruncatedRecord};
 
 use crate::errors::{
     CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, InvalidOptions,
@@ -38,9 +38,13 @@ use crate::helpers::{
     NUM_HASHES, check_crc, create_new_data_file, get_hashed_key_positions, new_timestamp,
     read_exact_or_truncated, read_range,
 };
+use crate::hlc::Hlc;
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 use crate::lsm::SyncConfig::{Always, Every};
+use crate::lsm::WalRecoveryMode::{AbsoluteConsistency, PointInTime};
+use crate::lsm::WalReplayState::Clean;
 use crate::manifest::{Manifest, ManifestEdit};
+use crate::memtable::AVL;
 
 use std::cmp::{Ordering as CmpOrdering, Reverse, max};
 
@@ -53,7 +57,7 @@ enum SyncConfig {
     Always,     // Ddurable
 }
 
-enum Lookup {
+pub enum Lookup {
     Found(Vec<u8>),
     Deleted,
     Absent,
@@ -228,6 +232,12 @@ impl WAL {
         let _ = remove_file(&self.path);
         Ok(())
     }
+    fn sync(&mut self) -> Result<()> {
+        let writer = self.wal_writer.as_mut().ok_or(DbError::WalNotFound)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        Ok(())
+    }
 
     fn record_to_wal<'a>(&mut self, record: WalRecordType<'a>, timestamp: u64) -> Result<()> {
         let record_buffer = &mut self.record_buffer;
@@ -378,19 +388,26 @@ impl SSTable {
         let mut f = File::open(path)?;
         let file_metadata = f.metadata()?;
 
-        if file_metadata.len() <= FOOTER_LEN as u64 {
-            // file too small
-            // err
+        let file_len = file_metadata.len();
+        if file_len <= FOOTER_LEN as u64 {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset: 0,
+                file_path: path.to_path_buf(),
+                reason: CorruptionType::FileTooSmall {
+                    min_size: FOOTER_LEN as u64 + 1, // the check is `<=`, so FOOTER_LEN itself is rejected
+                    found: file_len,
+                },
+            }));
         }
         let stem = path
             .file_stem()
             .and_then(|x| x.to_str())
-            .ok_or_else(|| DbError::NonNumericFileIdOnSstable(path.to_path_buf()))?; // skip if this happens
+            .ok_or_else(|| DbError::InvalidSstableFileName(path.to_path_buf()))?; // skip if this happens
 
         let id = stem
             .parse::<u64>()
             .ok()
-            .ok_or_else(|| DbError::InvalidSstableFileName(path.to_path_buf()))?; // Have the caller skip file if this happens
+            .ok_or_else(|| DbError::NonNumericFileIdOnSstable(path.to_path_buf()))?; // Have the caller skip file if this happens
 
         f.seek(SeekFrom::End(-(FOOTER_LEN as i64)))?;
         let mut footer = [0u8; FOOTER_FIXED_LEN];
@@ -429,7 +446,6 @@ impl SSTable {
                 reason: SstLevelMalformed(level as usize),
             }));
         }
-        let file_length = f.metadata()?.len();
 
         let sparse_index_offset = read_u64(&footer, FOOTER_SPARSE_OFFSET_START)?;
 
@@ -461,12 +477,12 @@ impl SSTable {
 
         // check_key_value_record_does_not_exceed_max(size, max_size, offset, file_path)
         // TODO: have the helper function above work with different kinds of data_corruption // not just k/v record check
-        if full_data_length > file_length {
+        if full_data_length > file_len {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
                 offset: sparse_index_offset,
                 file_path: path.to_path_buf(),
                 reason: CorruptionType::MetaDataSizeExceedsFileSize {
-                    file_size: file_length,
+                    file_size: file_len,
                     metadata_size: full_data_length,
                 },
             }));
@@ -554,7 +570,7 @@ impl SSTable {
             id,
             file: f,
             file_path: path.to_path_buf(),
-            file_size: file_length,
+            file_size: file_len,
             min_max_keys: min_max,
             sparse_index: Arc::new(parsed_sparse_index),
             bloom_filter,
@@ -663,459 +679,6 @@ impl SSTable {
         Ok(())
     }
 }
-pub struct AVL {
-    root: Option<Box<Node>>,
-    threshold: u64,
-    size: u64,
-    size_in_bytes: u64,
-}
-#[derive(PartialEq, Clone, Debug)]
-struct AvlEntry {
-    key: Vec<u8>,
-    value: Vec<u8>,
-    deleted: bool,
-    timestamp: u64,
-}
-#[derive(PartialEq, Clone, Debug)]
-struct Node {
-    // (Done): Node should actually carry timestamp, exactly at the time a Node is created
-    // Right now we get the timestamp when we serialize the kv which is basically called for everynode as we are flushing
-    entry: AvlEntry,
-    height: u64,
-    left: Option<Box<Node>>,
-    right: Option<Box<Node>>,
-}
-
-impl Node {
-    fn serialize_kv(&self) -> Vec<u8> {
-        // return [ tstamp(8) | ksz(8) | value_sz(8) | tombstone | key | value |  ]
-        let tstamp = self.entry.timestamp.to_le_bytes();
-        let ksz = (self.entry.key.len() as u64).to_le_bytes();
-        let vsz = (self.entry.value.len() as u64).to_le_bytes();
-        let tombstone_in_byte: [u8; TOMBSTONE_LEN] = [if self.entry.deleted {
-            TOMBSTONE_DELETED
-        } else {
-            TOMBSTONE_LIVE
-        }];
-
-        [
-            &tstamp,
-            &ksz,
-            &vsz,
-            tombstone_in_byte.as_slice(),
-            self.entry.key.as_slice(),
-            &self.entry.value,
-        ]
-        .concat()
-    }
-}
-
-impl AVL {
-    fn new(threshold: u64) -> Self {
-        Self {
-            root: None,
-            threshold,
-            size: 0,
-            size_in_bytes: 0,
-        }
-    }
-
-    fn get(&self, key: &[u8]) -> Lookup {
-        let mut current = self.root.as_ref();
-        while let Some(curr) = current {
-            if curr.entry.key == key {
-                if !curr.entry.deleted {
-                    return Found(curr.entry.value.to_vec());
-                } else {
-                    return Deleted;
-                }
-            }
-            if curr.entry.key.as_slice() > key {
-                current = curr.left.as_ref();
-            } else {
-                current = curr.right.as_ref();
-            }
-        }
-        Absent
-    }
-
-    fn update_height(node: &mut Box<Node>) {
-        let left_height = if let Some(x) = node.left.as_ref() {
-            x.height as i64
-        } else {
-            -1
-        };
-
-        let right_height = if let Some(x) = node.right.as_ref() {
-            x.height as i64
-        } else {
-            -1
-        };
-        node.height = (1 + max(left_height, right_height)) as u64;
-    }
-    fn insert(&mut self, curr: Option<Box<Node>>, n: Node) -> Option<Box<Node>> {
-        if let Some(mut node) = curr {
-            if n.entry.key == node.entry.key {
-                let old_len = node.entry.value.len() as u64;
-                node.entry.value = n.entry.value;
-                // We do this here because we when we delete something, we dont delete the node, we just replace the value with an empty vector
-                // and we mark it as deleted so when it gets flushed to memory, the deleted flag maps to a tombstone
-                node.entry.deleted = n.entry.deleted;
-                node.entry.timestamp = n.entry.timestamp; // most recent of deletion
-                self.size_in_bytes = self.size_in_bytes - old_len + node.entry.value.len() as u64;
-
-                return Some(node);
-            }
-            if n.entry.key < node.entry.key {
-                node.left = self.insert(node.left.take(), n);
-            } else {
-                node.right = self.insert(node.right.take(), n);
-            }
-
-            node = Self::balance(node);
-            Some(node)
-        } else {
-            self.size_in_bytes +=
-                n.entry.value.len() as u64 + n.entry.key.len() as u64 + RECORD_HEADER_LEN as u64; // 25 account for record metadata// TODO: find all usge of numbers and make it a const
-            self.size += 1;
-            Some(Box::new(n))
-        }
-    }
-    /*
-
-    */
-    fn exceeds_max(
-        &self,
-        key_size: u64,
-        value_size: u64,
-    ) -> std::result::Result<(), InvalidMemtableInput> {
-        if key_size > KEY_MAX_BYTES_SIZE {
-            return Err(InvalidMemtableInput::KeySizeTooLarge {
-                max: KEY_MAX_BYTES_SIZE,
-                found: key_size,
-            });
-        }
-        if value_size > VALUE_MAX_BYTES_SIZE {
-            return Err(InvalidMemtableInput::ValueSizeTooLarge {
-                max: VALUE_MAX_BYTES_SIZE,
-                found: value_size,
-            });
-        }
-        Ok(())
-    }
-    fn put(&mut self, key: &[u8], value: &[u8], timestamp: u64) {
-        let n = Node {
-            entry: AvlEntry {
-                key: key.to_vec(),
-                value: value.to_vec(),
-                deleted: false,
-                timestamp,
-            },
-            height: 0,
-            left: None,
-            right: None,
-        };
-        let root = self.root.take();
-        self.root = self.insert(root, n);
-    }
-
-    fn balance(mut node: Box<Node>) -> Box<Node> {
-        Self::update_height(&mut node);
-        let bf = Self::compute_balance_factor_of_node(&node);
-
-        if bf > 1 {
-            // left heavy
-
-            let left_node = node.left.as_mut().unwrap();
-            match Self::compute_balance_factor_of_node(left_node) {
-                bf if bf >= 0 => {
-                    let left = node.left.take().unwrap();
-
-                    node = Self::right_rotation(node, left);
-                }
-                _ => {
-                    let mut left_child = node.left.take().unwrap();
-                    let right_of_left = left_child.right.take().unwrap();
-                    left_child = Self::left_rotation(left_child, right_of_left);
-                    node = Self::right_rotation(node, left_child)
-                }
-            }
-        } else if bf < -1 {
-            // right heavy
-
-            let right_node = node.right.as_mut().unwrap();
-            match Self::compute_balance_factor_of_node(right_node) {
-                bf if bf <= 0 => {
-                    let right = node.right.take().unwrap();
-                    node = Self::left_rotation(node, right);
-                }
-                _ => {
-                    let mut right_child = node.right.take().unwrap();
-                    let left_of_right = right_child.left.take().unwrap();
-                    right_child = Self::right_rotation(right_child, left_of_right);
-                    node = Self::left_rotation(node, right_child);
-                }
-            }
-        }
-
-        node
-    }
-
-    fn left_rotation(mut parent: Box<Node>, mut child: Box<Node>) -> Box<Node> {
-        // parent and child.right
-        parent.right = child.left.take();
-
-        child.left = Some(parent);
-
-        if let Some(left) = child.left.as_mut() {
-            Self::update_height(left);
-        }
-        Self::update_height(&mut child);
-        child
-    }
-    fn right_rotation(mut parent: Box<Node>, mut child: Box<Node>) -> Box<Node> {
-        // parent and child.left
-        parent.left = child.right.take();
-        child.right = Some(parent);
-        if let Some(right) = child.right.as_mut() {
-            Self::update_height(right);
-        }
-        Self::update_height(&mut child);
-        child
-    }
-
-    fn compute_balance_factor_of_node(node: &Node) -> i32 {
-        let bf_l = if let Some(x) = node.left.as_ref() {
-            x.height as i32
-        } else {
-            -1
-        };
-        let bf_r = if let Some(x) = node.right.as_ref() {
-            x.height as i32
-        } else {
-            -1
-        };
-        bf_l - bf_r
-    }
-    fn take_min(mut curr: Box<Node>) -> (Option<Box<Node>>, Option<Box<Node>>) {
-        // in order successor.
-        // we have passed the right child here
-        // go left till the end
-
-        // None
-        if curr.left.is_none() {
-            let right = curr.right.take();
-            return (Some(curr), right);
-        }
-
-        let (min_node, left_node) = Self::take_min(curr.left.take().unwrap());
-        curr.left = left_node;
-        (min_node, Some(Self::balance(curr)))
-    }
-
-    fn delete(&mut self, key: &[u8], timestamp: u64) {
-        let node = Node {
-            entry: AvlEntry {
-                key: key.to_vec(),
-                value: Vec::new(),
-                deleted: true,
-                timestamp,
-            },
-            height: 0,
-            left: None,
-            right: None,
-        };
-
-        let root = self.root.take();
-        self.root = self.insert(root, node);
-    }
-
-    fn get_min_node(node: &Option<Box<Node>>) -> Option<&Node> {
-        let mut curr = node.as_ref()?;
-        while let Some(n) = curr.left.as_ref() {
-            curr = n
-        }
-
-        Some(curr.as_ref())
-    }
-    fn get_max_node(node: &Option<Box<Node>>) -> Option<&Node> {
-        let mut curr = node.as_ref()?;
-
-        while let Some(n) = curr.right.as_ref() {
-            curr = n
-        }
-
-        Some(curr.as_ref()) // 
-    }
-
-    pub fn serialize_sstable_footer(
-        offset: u64,
-        min_key: &[u8],
-        max_key: &[u8],
-        sizeof_si: u64,
-        sizeof_bf: u64,
-        level: u8,
-    ) -> Vec<u8> {
-        let mut footer: Vec<u8> = Vec::new();
-
-        footer.extend_from_slice(min_key);
-        footer.extend_from_slice(max_key);
-
-        footer.extend_from_slice(&offset.to_le_bytes());
-        footer.extend_from_slice(&sizeof_si.to_le_bytes());
-        footer.extend_from_slice(&sizeof_bf.to_le_bytes());
-        footer.extend_from_slice(&(min_key.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&(max_key.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&level.to_le_bytes()); // Level of sstable, starts at L0
-        // entire footer: | sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) |
-        // | sizeof(maxkey) | level | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc | metadata_crc(4 bytes) |
-
-        footer
-    }
-
-    fn build_sstable_recursive(
-        &self,
-        writer: &mut BufWriter<File>,
-        n: &Option<Box<Node>>,
-        bf: &mut BloomFilter,
-        data_block: &mut Option<SsTableDataBlock>,
-        sparse_index: &mut SparseIndex,
-        offset: &mut u64,
-    ) -> Result<()> {
-        if let Some(x) = n {
-            self.build_sstable_recursive(writer, &x.left, bf, data_block, sparse_index, offset)?;
-            if let Some(ss_data_block) = data_block {
-                match ss_data_block.is_finished() {
-                    true => {
-                        let owned_ss_data_block =
-                            data_block.take().expect("Expected a SsTableDataBlock");
-                        let data_len = owned_ss_data_block.bytes.get_ref().len() as u64; // before 4 byte crc
-                        let full = owned_ss_data_block.full_data_block();
-
-                        writer.write_all(full.bytes.get_ref())?; // including 4 byte crc
-
-                        sparse_index.add_entry(&full.starting_key, data_len, *offset);
-                        *offset += full.bytes.get_ref().len() as u64;
-
-                        let mut new_ss_db = SsTableDataBlock::new(&x.entry.key);
-                        new_ss_db.append_to_block(&x.serialize_kv());
-                        *data_block = Some(new_ss_db);
-                    }
-                    false => {
-                        ss_data_block.append_to_block(&x.serialize_kv());
-                    }
-                }
-            } else {
-                let mut new_ss_db = SsTableDataBlock::new(&x.entry.key);
-                new_ss_db.append_to_block(&x.serialize_kv());
-                *data_block = Some(new_ss_db);
-            }
-            let positions = get_hashed_key_positions(&x.entry.key, bf.num_bits as usize);
-            bf.set_bits(positions);
-            self.build_sstable_recursive(writer, &x.right, bf, data_block, sparse_index, offset)?;
-        }
-        Ok(())
-    }
-
-    fn sync_avl(&self, dir: &Path, hlc: u64) -> Result<Option<(File, PathBuf)>> {
-        let min_k = match Self::get_min_node(&self.root) {
-            Some(k) => &k.entry.key,
-            None => return Ok(None),
-        };
-
-        let max_k = match Self::get_max_node(&self.root) {
-            Some(k) => &k.entry.key,
-            None => return Ok(None),
-        };
-
-        let (file, ss_path_final) = create_new_data_file(dir, hlc)?;
-        let tmp_path_for_err_case = ss_path_final.clone();
-
-        // TODO LATER: Have a Manifest file that just keeps track of what files are active and if a file iƒt in the Manifest it gets deleted.
-        (|| -> Result<Option<(File, PathBuf)>> {
-            // TODO: Can also put in a function
-            let mut writer = BufWriter::new(file);
-            //
-            let mut data_block: Option<SsTableDataBlock> = None;
-
-            // Also TODO: see if you can use SstFinalizer here
-
-            // sizeof(key) | key | offset | datablock block length ( before CRC )
-            let mut sparse_index = SparseIndex::new();
-            let mut bloom_filter = BloomFilter::new(self.size as usize * BLOOM_BITS_PER_KEY);
-
-            let mut file_offset: u64 = 0;
-            self.build_sstable_recursive(
-                &mut writer,
-                &self.root,
-                &mut bloom_filter,
-                &mut data_block,
-                &mut sparse_index,
-                &mut file_offset,
-            )?;
-
-            if let Some(last_db) = data_block {
-                let len = last_db.bytes.get_ref().len() as u64;
-
-                let full = last_db.full_data_block();
-                writer.write_all(full.bytes.get_ref())?;
-
-                sparse_index.add_entry(&full.starting_key, len, file_offset);
-
-                file_offset += full.bytes.get_ref().len() as u64; // length here is the start of sparse_index // 
-            }
-            let footer = Self::serialize_sstable_footer(
-                file_offset,
-                min_k,
-                max_k,
-                sparse_index.index_entries.len() as u64,
-                (bloom_filter.bits.len() * U64_LEN) as u64, // multiply by 8, needed for reading the u8s during load
-                0_u8,                                       // LEVEL 0
-            );
-
-            let footer_len = footer.len();
-
-            let footer_crc =
-                CRC32.compute_crc_data_block(&footer[footer_len - FOOTER_FIXED_LEN..footer_len]);
-            let min_max_crc =
-                CRC32.compute_crc_data_block(&footer[..footer_len - FOOTER_FIXED_LEN]);
-            let sparse_crc = CRC32.compute_crc_data_block(&sparse_index.index_entries);
-
-            writer.write_all(&sparse_index.index_entries)?;
-
-            let mut bloom_digest = CRC32.digest();
-
-            for word in &bloom_filter.bits {
-                bloom_digest.update(&word.to_le_bytes());
-                writer.write_all(&word.to_le_bytes())?;
-            }
-            let bloom_crc = bloom_digest.finalize();
-
-            writer.write_all(&footer)?;
-            writer.write_all(&sparse_crc.to_le_bytes())?;
-            writer.write_all(&bloom_crc.to_le_bytes())?;
-            writer.write_all(&min_max_crc.to_le_bytes())?;
-
-            writer.write_all(&footer_crc.to_le_bytes())?;
-
-            let f = writer.into_inner().map_err(|e| {
-                DbError::FileError(
-                    format!("Failed to extract File from BufWriter: {}", e.error()),
-                    ss_path_final.to_path_buf(),
-                )
-            })?;
-            f.sync_all()?;
-
-            // fs::rename(&ss_path_tmp, &ss_path_final)?; // unecessary now
-
-            Ok(Some((f, ss_path_final)))
-        })()
-        .map_err(|err| {
-            let _ = fs::remove_file(&tmp_path_for_err_case);
-            DbError::SyncFail(Box::new(err), tmp_path_for_err_case)
-        })
-    }
-}
 
 pub enum FlushingThreadResponse {
     Success { id: u64, sstable: SSTable },
@@ -1125,12 +688,12 @@ pub enum FlushingThreadResponse {
 struct FlushingManager {
     tx: Sender<FlushingThreadResponse>,
     rx: Receiver<FlushingThreadResponse>,
+    in_flight: Vec<JoinHandle<Result<()>>>,
 }
 
 pub enum WalReplayState {
-    Clean, // replayed everything to mem
-    PartialTruncated, // JUST DELETE FILE HERE
-           // u64 is the position of the last valid wal record(the last valid record before we threw error), err // HERE YOU TELL THE CALLER THAT FILE IS CORRUPT
+    Clean,                 // replayed everything to mem
+    PartialError(DbError), // either truncation or corruption
 }
 pub struct WalToMemtableReplay {
     memtable: AVL,
@@ -1143,7 +706,11 @@ pub struct WalToMemtableReplay {
 impl FlushingManager {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<FlushingThreadResponse>();
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            in_flight: Vec::new(),
+        }
     }
 
     // main will poll and on success, will add the SST to active memory and delete old_wal from directory
@@ -1154,7 +721,8 @@ impl FlushingManager {
     ) -> Result<()> {
         let tx: Sender<FlushingThreadResponse> = self.tx.clone();
         let id = frozen_instance.id;
-        spawn(move || -> Result<()> {
+        self.in_flight.retain(|handle| !handle.is_finished());
+        let handle = spawn(move || -> Result<()> {
             let result = (|| -> Result<SSTable> {
                 let (_, ss_path_final) = frozen_instance
                     .memtable
@@ -1175,11 +743,16 @@ impl FlushingManager {
             Ok(())
         });
 
+        self.in_flight.push(handle);
         Ok(())
     }
 
-    fn build_avl_from_wal(&self, path: &PathBuf) -> Result<WalToMemtableReplay> {
-        let mut memtable = AVL::new(MEMTABLE_THRESHOLD);
+    fn build_avl_from_wal(
+        &self,
+        path: &PathBuf,
+        memtable_threshold: u64,
+    ) -> Result<WalToMemtableReplay> {
+        let mut memtable = AVL::new(memtable_threshold);
         let mut curr_offset: u64 = 0;
         let mut records_recovered = 0;
         let mut most_recent_hlc: Option<u64> = None;
@@ -1318,7 +891,7 @@ impl FlushingManager {
 
         let replay_state = match outcome {
             Ok(()) => WalReplayState::Clean,
-            Err(DbError::DataCorrupted(e)) => WalReplayState::PartialTruncated, // we keep all the valid records from wal that we can salvage
+            Err(err @ DbError::DataCorrupted(_)) => WalReplayState::PartialError(err),
             Err(e) => return Err(e),
         };
 
@@ -1331,49 +904,10 @@ impl FlushingManager {
         })
     }
 
-    fn retrieve_wal_records(
-        &self,
-        path: &PathBuf,
-        dir: &PathBuf,
-        hlc: &Hlc,
-    ) -> Result<Option<SSTable>> {
-        let replay = self.build_avl_from_wal(path)?;
-
-        let Some(max_hlc) = replay.most_recent_hlc else {
-            let _ = fs::remove_file(path); // no hlc no records
-            return Ok(None);
-        };
-        hlc.recover_to(max_hlc);
-
-        let (f, ss_final_path) = match replay.memtable.sync_avl(dir, max_hlc) {
-            Ok(Some((f, ss_final_path))) => {
-                if let Some(dir) = ss_final_path.parent() {
-                    // always should have parent
-                    File::open(dir)?.sync_all()?;
-                }
-
-                (f, ss_final_path)
-            }
-            Err(DbError::SyncFail(err, path)) => {
-                let _ = fs::remove_file(&path);
-
-                return Err(DbError::SyncFail(err, path.to_path_buf()));
-            }
-
-            Err(err) => {
-                return Err(err);
-            }
-            Ok(None) => {
-                return {
-                    let _ = fs::remove_file(path);
-                    Ok(None)
-                };
-            }
-        };
-
-        let sstable = SSTable::load(&ss_final_path)?;
-
-        Ok(Some(sstable))
+    fn join_all_handles(&mut self) {
+        for handle in self.in_flight.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1384,11 +918,9 @@ struct FrozenMemtableInstance {
     wal_id: u64,
     flush_attempts: u8,
 }
-// TODO:
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 pub enum WalRecoveryMode {
-    TolerateTornTail, // drop a torn tail in the newest WAL; any other damage is an error
     PointInTime, // stop at the first damage, skip every newer WAL, open at that moment(loses data but recovers)
     AbsoluteConsistency, // any damage at all, even a torn tail, is an error
 }
@@ -1444,7 +976,7 @@ impl KVEngineOptions {
 struct KVEngine {
     // node_id: have a unique ID here
     data_directory: PathBuf, // data_directory now holds all .sst and .wal files
-    sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>, // [vec0(l0), vec1(l1)] .. etc/
+    sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>,
     wal: WAL,
     memtable: AVL,
     frozen_memtables: BTreeMap<u64, FrozenMemtableInstance>, // ordered. id(hlc) -> mem
@@ -1457,70 +989,6 @@ struct KVEngine {
     options: KVEngineOptions,
 }
 
-pub struct Hlc {
-    hlc: AtomicU64,
-}
-
-impl Hlc {
-    fn new() -> Self {
-        // we always create a new one for now, but in reality, we only create a new one on first boot, then we check the last most recent
-        // timestmap in the database and we check if we need a new timestamp or we use the last one + counter goes up
-        Self {
-            hlc: AtomicU64::new(new_timestamp() << NUM_OF_BITS_FOR_COUNTER),
-        } // counter starts at 0 here
-    }
-
-    fn curr_timestamp(&self) -> u64 {
-        new_timestamp() << NUM_OF_BITS_FOR_COUNTER
-    }
-
-    pub fn sync_with_remote(&self, remote_hlc: u64) -> u64 {
-        self.advance(remote_hlc)
-    }
-
-    pub fn recover_to(&self, hlc_from_disk: u64) -> u64 {
-        self.advance(hlc_from_disk)
-    }
-
-    pub fn tick(&self) -> u64 {
-        self.advance(0)
-    }
-    fn advance(&self, floor: u64) -> u64 {
-        let curr_tstamp = self.curr_timestamp();
-        let mut prev = self.hlc.load(Relaxed);
-        loop {
-            let max = prev.max(floor);
-            let hlc_tstamp = max & MASK_FOR_TSTAMP;
-
-            let new = if hlc_tstamp >= curr_tstamp {
-                let new_counter = (max & MASK_FOR_COUNTER) + 1;
-                if new_counter > MASK_FOR_COUNTER {
-                    // if counter overflows, we add 1 to the timestamp, so we are advancing the physical clock and resetting counter to 0
-                    // physical clock starts 12 bits to the left so thats why we add the operation below
-                    hlc_tstamp + (MASK_FOR_COUNTER + 1) // Mask is 12 ones, add 1 to get 4096
-                } else {
-                    hlc_tstamp | new_counter // new counter here is at most 4095 no need to use mask
-                }
-            } else {
-                curr_tstamp
-            };
-
-            match self
-                .hlc
-                .compare_exchange_weak(prev, new, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => return new,
-                Err(x) => prev = x,
-            }
-        }
-    }
-
-    pub fn deserialize_hlc(hlc: u64) -> (u64, u64) {
-        // returns (timestmap, counter)
-        ((hlc >> NUM_OF_BITS_FOR_COUNTER), (hlc & MASK_FOR_COUNTER)) // timestamp okay to move down to lower bits, counter cant move up
-    }
-}
-
 impl KVEngine {
     fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
@@ -1530,7 +998,7 @@ impl KVEngine {
 
         let mut sstables: [Vec<SSTable>; SST_LEVEL_COUNT] = [const { Vec::new() }; SST_LEVEL_COUNT];
 
-        let memtable = AVL::new(MEMTABLE_THRESHOLD);
+        let memtable = AVL::new(options.memtable_threshold);
 
         let mut sst_vec: Vec<(u64, PathBuf)> = Vec::new();
         let mut wal_vec: Vec<(u64, PathBuf)> = Vec::new();
@@ -1603,9 +1071,8 @@ impl KVEngine {
         let hlc = Hlc::new();
 
         hlc.recover_to(max_hlc);
-        let wal = WAL::new(MEMTABLE_THRESHOLD, options.sync, &path, hlc.tick())?;
+        let wal = WAL::new(options.memtable_threshold, options.sync, &path, hlc.tick())?;
         // IMPORTANT: The new wal is created after we check the actual directory for wal files.
-        // This is important because we do not want to call retrieve_wal_records() on the new empty wal
 
         let mut self_instance = Self {
             data_directory: path,
@@ -1677,31 +1144,9 @@ impl KVEngine {
 
         wals_to_replay.sort_by_key(|(id, _)| *id);
 
-        for (id, path) in wals_to_replay {
-            // wal populates this and we flush it to disk as an .sst
+        let recovered = self_instance.retrieve__wal_records(&wals_to_replay)?;
+        sstables[0].extend(recovered);
 
-            match self_instance.flushing_manager.retrieve_wal_records(
-                &path,
-                &self_instance.data_directory,
-                &self_instance.hlc,
-            ) {
-                Ok(Some(ss)) => {
-                    self_instance.manifest.edit_and_append(&ManifestEdit {
-                        new_files: vec![(0, ss.id)],
-                        deleted_files: vec![],
-                        min_live_wal: Some(id + 1),
-                    })?;
-                    if ss.level < SST_LEVEL_COUNT as u8 {
-                        sstables[ss.level as usize].push(ss);
-                    } else {
-                        self_instance.corrupted_files.insert(ss.file_path);
-                    }
-                    let _ = remove_file(path);
-                }
-                Err(e) => return Err(e),
-                Ok(None) => continue,
-            }
-        }
         // TODO MAYBE: Other than L0, all the other levels have no overlapping keys in the sstables
         // meaning that they could be ordered by min_k, that way a binary search can be done on them instead of linearly checking every sst for the record
         // good enough for now
@@ -1711,6 +1156,56 @@ impl KVEngine {
 
         self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
         Ok(self_instance)
+    }
+    fn retrieve__wal_records(&mut self, wals: &[(u64, PathBuf)]) -> Result<Vec<SSTable>> {
+        let mut recovered = Vec::new();
+        for (index, (id, path)) in wals.iter().enumerate() {
+            let replay = self
+                .flushing_manager
+                .build_avl_from_wal(path, self.options.memtable_threshold)?;
+
+            let should_stop_replaying = match (replay.replay_state, self.options.wal_recovery_mode)
+            {
+                (WalReplayState::Clean, _) => false,
+                (WalReplayState::PartialError(_), WalRecoveryMode::PointInTime) => true,
+                (WalReplayState::PartialError(e), WalRecoveryMode::AbsoluteConsistency) => {
+                    return Err(e);
+                }
+            };
+
+            if should_stop_replaying {
+                self.skip_files_from_index(&wals[index + 1..])?;
+            }
+
+            let mut new_files = Vec::new();
+
+            if let Some(max_hlc) = replay.most_recent_hlc {
+                self.hlc.recover_to(max_hlc);
+
+                if let Some((_, ss_final_path)) =
+                    replay.memtable.sync_avl(&self.data_directory, max_hlc)?
+                {
+                    File::open(&self.data_directory)?.sync_all()?;
+                    let sst = SSTable::load(&ss_final_path)?;
+
+                    new_files.push((0, sst.id));
+                    recovered.push(sst);
+                }
+            }
+            self.manifest.edit_and_append(&ManifestEdit {
+                new_files,
+                deleted_files: vec![],
+                min_live_wal: Some(id + 1),
+            })?;
+
+            if should_stop_replaying {
+                fs::rename(path, path.with_extension("wal.corrupt"))?;
+                break;
+            }
+            let _ = fs::remove_file(path);
+        }
+
+        Ok(recovered)
     }
 
     fn should_search_sstable_file(key: &[u8], sstable: &SSTable) -> bool {
@@ -1863,6 +1358,16 @@ impl KVEngine {
         Ok(None)
     }
 
+    fn skip_files_from_index(&self, files: &[(u64, PathBuf)]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        for (_, path) in files {
+            rename(path, path.with_added_extension("skipped"))?;
+        }
+        File::open(&self.data_directory)?.sync_all()?;
+        Ok(())
+    }
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.memtable.get(key) {
             Found(bytes) => return Ok(Some(bytes.to_vec())),
@@ -1885,7 +1390,7 @@ impl KVEngine {
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if let Some(err_msg) = &self.db_failed {
-            return Err(DbError::ReadOnly(err_msg.to_string())); // maybe put the message in the Error
+            return Err(DbError::ReadOnly(err_msg.to_string()));
         }
         self.memtable
             .exceeds_max(key.len() as u64, value.len() as u64)?;
@@ -1950,7 +1455,7 @@ impl KVEngine {
     fn rotate_memtable_and_wal(&mut self) -> Result<()> {
         let max = self.options.max_frozen_memtables as usize;
         if self.frozen_memtables.len() >= max {
-            // block writes for a little
+            // block writes for a little(caller handles when it receives WritesStalled )
             while let Ok(msg) = self.flushing_manager.rx.try_recv() {
                 self.handle_flushing_message(msg)?;
             }
@@ -1964,7 +1469,7 @@ impl KVEngine {
         let old_wal = std::mem::replace(
             &mut self.wal,
             WAL::new(
-                MEMTABLE_THRESHOLD,
+                self.options.memtable_threshold,
                 self.options.sync,
                 &self.data_directory,
                 self.hlc.tick(),
@@ -1976,7 +1481,7 @@ impl KVEngine {
         // WHEN MAIN(whoever polls it) RECEIVES A SUCCESSFUL FLUSH, REMOVE THE OLD WAL ASSOCIATED WITH THAT FLUSH
         let frozen = Arc::new(std::mem::replace(
             &mut self.memtable,
-            AVL::new(MEMTABLE_THRESHOLD),
+            AVL::new(self.options.memtable_threshold),
         ));
 
         let tick = self.hlc.tick();
@@ -2022,11 +1527,9 @@ impl KVEngine {
 
         for sstable in sstables {
             let Some((curr_ss_min, curr_ss_max)) = sstable.min_max_keys.as_ref() else {
-                // jf ss has no min_max_keys(which we should always make sure it does since even if they are corrupted, we can rebuild by consulting the sparse_i)
-                // but in case theres nothing here just return an Error for now
                 return Err(DbError::MissingKey(
                     "Min-Max keys missing from SStables metadata".to_string(),
-                )); // TODO: fix this error return, its just here so it compiles, either return a correct error or rebuild min max
+                )); // When we load an SST, if min max is missing, we rebuild it so it will always be there at this point
             };
 
             curr_min_max = match curr_min_max {
@@ -2392,6 +1895,54 @@ impl KVEngine {
         if self.db_failed.is_none() {
             self.db_failed = Some(msg);
         }
+    }
+
+    fn close(mut self) -> Result<()> {
+        //
+
+        // we have to track the first error that goes wrong, for logging reasons and because we cant stop the close just because there was an error
+
+        let mut error: Option<DbError> = None;
+        if let Err(e) = self.wal.sync() {
+            self.fail(format!("WAL sync failed during close: {e}"));
+            error.get_or_insert(e);
+        }
+
+        loop {
+            // looping because we might have an error on flushing, so we retry which means we push another handle to the flushing manager
+            // so we have to make sure we drain all of them
+            self.flushing_manager.join_all_handles();
+            while let Ok(msg) = self.flushing_manager.rx.try_recv() {
+                if let Err(e) = self.handle_flushing_message(msg) {
+                    error.get_or_insert(e);
+                }
+            }
+            if self.flushing_manager.in_flight.is_empty() {
+                break;
+            }
+        }
+        let compaction = self.compaction_manager.wait_for_handle_finish();
+        if self.db_failed.is_none() // wals are on disk so if db has failed we skip
+            && let Err(e) = self.retire_frozen_memtables()
+        {
+            error.get_or_insert(e);
+        }
+        if self.db_failed.is_none()
+            && let Some(result) = compaction
+            && let Err(e) = self.finalize_compaction(result)
+        {
+            error.get_or_insert(e);
+        }
+
+        if let Some(e) = error {
+            return Err(e);
+        }
+
+        if let Some(msg) = self.db_failed.take() {
+            return Err(DbError::ReadOnly(msg)); // when we called close, the engine had failed already so if we dont return that here
+            // we might lose the original reason of the fail
+        }
+        Ok(())
     }
 }
 
