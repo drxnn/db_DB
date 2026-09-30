@@ -539,7 +539,9 @@ mod tests {
     }
 
     #[test]
-    fn test_each_rotation_case() {
+    fn each_rotation_case_works() {
         let memtable = populated_numbers_memtable();
+        // 1,2,3
+        // need a helper that returns nodes in order
     }
 }

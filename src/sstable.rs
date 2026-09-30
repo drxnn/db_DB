@@ -161,17 +161,13 @@ impl SSTable {
         let bloom_filter: &[u8] = read_range(
             &full_sst_data,
             bloom_filter_start as usize,
-            bloom_filter_end as usize as usize,
+            bloom_filter_end as usize,
         )?;
 
         let bloom_filter_crc_check = CRC32.compute_crc_data_block(bloom_filter);
 
         // &full_sst_data[(bloom_filter_start as usize)..(bloom_filter_end as usize)];
-        let min_key = read_range(
-            &full_sst_data,
-            min_k_start as usize,
-            min_k_end as usize as usize,
-        )?;
+        let min_key = read_range(&full_sst_data, min_k_start as usize, min_k_end as usize)?;
         // let min_key = &full_sst_data[(min_k_start as usize)..(min_k_end as usize)];
         // let max_k = &full_sst_data[(max_k_start as usize)..(max_k_end as usize)];
         let max_k = read_range(&full_sst_data, max_k_start as usize, max_k_end as usize)?;
@@ -497,5 +493,193 @@ impl Footer {
             max_key_len: read_u64(bytes, FOOTER_MAX_KEY_LEN_START)?,
             level: read_u8(bytes, FOOTER_LEVEL_START)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::{assert_eq, matches};
+
+    use super::*;
+
+    // test sstables methods, then make create a valid sst file and load it, then test the fields are correct
+    // then flip a bit in crcs to make sure we throw err
+    use std::fs::{self, OpenOptions};
+    use std::path::{Path, PathBuf};
+
+    use tempfile::{TempDir, tempdir};
+
+    use crate::constants::{
+        FOOTER_BLOOM_CRC_START, FOOTER_FIELDS_CRC_START, FOOTER_LEN, FOOTER_MIN_MAX_CRC_START,
+        FOOTER_SPARSE_CRC_START, MAX_MEMTABLE_THRESHOLD,
+    };
+
+    use crate::memtable::AVL;
+
+    fn write_sst() -> (TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let mut memtable = AVL::new(MAX_MEMTABLE_THRESHOLD);
+        const RECORDS: &[(&[u8], Option<&[u8]>)] = &[
+            (b"mango", Some(b"yellow")),
+            (b"apple", Some(b"red")),
+            (b"cherry", Some(b"dark red")),
+            (b"banana", Some(b"yellow")),
+            (b"apple", Some(b"green")), // overwrite newer value wins
+            (b"cherry", None),          // delete of an existing key
+            (b"kiwi", None),            // delete of a key we never put
+            (b"0-never-put", None),     // a tombstone that is also the smallest key()
+            (b"a", Some(b"prefix of apple")),
+            (b"app", Some(b"also a prefix")),
+            (b"empty-value", Some(b"")), // empty value, which is not a delete
+            (
+                b"zebra-this-key-is-deliberately-longer-than-the-57-byte-sst-trailer",
+                Some(b"long"),
+            ),
+            (b"banana", None),
+            (b"banana", Some(b"back again")),
+        ];
+        for (ts, (key, value)) in RECORDS.iter().enumerate() {
+            match value {
+                Some(v) => memtable.put(key, v, ts as u64),
+                None => memtable.delete(key, ts as u64),
+            }
+        }
+        let (_, path) = memtable.sync_avl(dir.path(), 10).unwrap().unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn loads_sst() {
+        let (dir, path_to_sst) = write_sst();
+        let loaded_ss = SSTable::load(&path_to_sst).unwrap();
+        let (min_k, max_k) = loaded_ss.min_max_keys.unwrap();
+        assert_eq!(
+            &max_k,
+            b"zebra-this-key-is-deliberately-longer-than-the-57-byte-sst-trailer"
+        );
+        assert_eq!(&min_k, b"0-never-put");
+        assert_eq!(loaded_ss.level, 0);
+        assert_eq!(
+            loaded_ss.file_size,
+            fs::metadata(&path_to_sst).unwrap().len()
+        );
+        assert!(loaded_ss.bloom_filter.is_some());
+        assert_eq!(loaded_ss.sparse_index.len(), 1); // everything we put is in 1 data block
+        assert_eq!(loaded_ss.id, 10);
+    }
+
+    #[test]
+    // flip for all metadata, then flip random recods
+    fn flipping_bit_in_sst_footer_crc_fails_to_load_sst() {
+        let (dir, path_to_sst) = write_sst();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path_to_sst)
+            .unwrap();
+        let file_len = f.metadata().unwrap().len();
+
+        let mut footer_crc = [0u8; 4];
+        let _ = f.read_exact_at(
+            &mut footer_crc,
+            file_len - (FOOTER_LEN - FOOTER_FIELDS_CRC_START) as u64,
+        );
+        footer_crc[2] ^= 0x01;
+        let _ = f.write_all_at(
+            &footer_crc,
+            file_len - (FOOTER_LEN - FOOTER_FIELDS_CRC_START) as u64,
+        );
+
+        assert!(matches!(
+            SSTable::load(&path_to_sst),
+            Err(DbError::DataCorrupted(DataCorruptedErr {
+                reason: CorruptionType::CrcMismatch {
+                    mismatch_type: CrcType::SstFooterMetadata,
+                    ..
+                },
+                ..
+            }))
+        ));
+    }
+    #[test]
+    fn flipping_bit_in_sst_bloom_crc_drops_the_bloom() {
+        let (dir, path_to_sst) = write_sst();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path_to_sst)
+            .unwrap();
+        let file_len = f.metadata().unwrap().len();
+
+        let mut bloom_crc = [0u8; 4];
+        let _ = f.read_exact_at(
+            &mut bloom_crc,
+            file_len - (FOOTER_LEN - FOOTER_BLOOM_CRC_START) as u64,
+        );
+        bloom_crc[2] ^= 0x01;
+        let _ = f.write_all_at(
+            &bloom_crc,
+            file_len - (FOOTER_LEN - FOOTER_BLOOM_CRC_START) as u64,
+        );
+
+        let loaded_ss = SSTable::load(&path_to_sst).unwrap();
+        assert!(loaded_ss.bloom_filter.is_none()) // if bloom crc is bad, we just skip it
+    }
+    #[test]
+    fn flipping_bit_in_sst_minmax_crc_rebuilds_minmax() {
+        let (dir, path_to_sst) = write_sst();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path_to_sst)
+            .unwrap();
+        let file_len = f.metadata().unwrap().len();
+
+        let mut min_max = [0u8; 4];
+        let _ = f.read_exact_at(
+            &mut min_max,
+            file_len - (FOOTER_LEN - FOOTER_MIN_MAX_CRC_START) as u64,
+        );
+        min_max[2] ^= 0x01;
+        let _ = f.write_all_at(
+            &min_max,
+            file_len - (FOOTER_LEN - FOOTER_MIN_MAX_CRC_START) as u64,
+        );
+
+        let loaded_ss = SSTable::load(&path_to_sst).unwrap();
+        assert!(loaded_ss.min_max_keys.is_some()) // even though we had a bad crc, we rebuilt it
+    }
+    #[test]
+    fn flipping_bit_in_sst_sparse_crc_fails_to_load_sst() {
+        let (dir, path_to_sst) = write_sst();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path_to_sst)
+            .unwrap();
+        let file_len = f.metadata().unwrap().len();
+
+        let mut footer_crc = [0u8; 4];
+        let _ = f.read_exact_at(
+            &mut footer_crc,
+            file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
+        );
+        footer_crc[2] ^= 0x01;
+        let _ = f.write_all_at(
+            &footer_crc,
+            file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
+        );
+
+        assert!(matches!(
+            SSTable::load(&path_to_sst),
+            Err(DbError::DataCorrupted(DataCorruptedErr {
+                reason: CorruptionType::CrcMismatch {
+                    mismatch_type: CrcType::SparseIndex,
+                    ..
+                },
+                ..
+            }))
+        ));
     }
 }
