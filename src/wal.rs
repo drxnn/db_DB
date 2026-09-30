@@ -294,3 +294,92 @@ pub(crate) enum WalRecordType<'a> {
     Deletion(&'a [u8]),            // ( key )
     Insertion(&'a [u8], &'a [u8]), // (key, value)
 }
+
+#[cfg(test)]
+mod tests {
+
+    use crate::{
+        constants::MAX_MEMTABLE_THRESHOLD,
+        lsm::Lookup::{Deleted, Found},
+        test_utils::flip_bit_at,
+    };
+    use std::{assert_eq, collections::HashMap, fs, matches};
+
+    use super::*;
+    use tempfile::{TempDir, tempdir};
+    const WAL_ID: u64 = 1;
+
+    const BIG_VALUE: [u8; 20_000] = [b'x'; 20_000];
+
+    const WAL_RECORDS: &[(&[u8], Option<&[u8]>)] = &[
+        (b"user:1", Some(b"alice")),
+        (b"user:2", Some(b"bob")),
+        (b"user:1", Some(b"alice-updated")),
+        (b"user:2", None),
+        (b"user:3", None),
+        (b"empty", Some(b"")),
+        (b"bin\x00key", Some(b"\x00\x02\x04\xff")), // tag bytes
+        (b"big", Some(&BIG_VALUE)),
+        (b"user:4", Some(b"dave")), // a record after the big one
+    ];
+    fn create_wal() -> (TempDir, WAL) {
+        let dir = tempdir().unwrap();
+        let wal = WAL::new(MAX_MEMTABLE_THRESHOLD, SyncConfig::None, dir.path(), WAL_ID).unwrap();
+        (dir, wal)
+    }
+
+    // write a bunch of records, replay wal
+
+    #[test]
+    fn writes_and_replays_records_from_wal() {
+        let mut latest_records: HashMap<&[u8], Option<&[u8]>> = HashMap::new();
+        let (_dir, mut wal) = create_wal();
+        for (ts, (key, value)) in WAL_RECORDS.iter().enumerate() {
+            let record = match value {
+                Some(v) => WalRecordType::Insertion(key, v),
+                None => WalRecordType::Deletion(key),
+            };
+            latest_records.insert(key, *value); // for the test below
+            wal.record_to_wal(record, ts as u64).unwrap();
+        }
+
+        let replay = WAL::build_avl_from_wal(&wal.path, MAX_MEMTABLE_THRESHOLD).unwrap();
+        assert!(matches!(replay.replay_state, WalReplayState::Clean));
+
+        for (k, v) in latest_records {
+            let expected = match v {
+                Some(v) => Found(v.to_vec()),
+                None => Deleted,
+            };
+            assert_eq!(replay.memtable.get(k), expected,);
+        }
+
+        assert_eq!(replay.records_recovered, WAL_RECORDS.len() as u64);
+        assert_eq!(replay.most_recent_hlc, Some(WAL_RECORDS.len() as u64 - 1));
+        assert_eq!(replay.valid_bytes, fs::metadata(&wal.path).unwrap().len());
+    }
+
+    #[test]
+
+    fn record_with_bad_type_tag_stops_replay() {
+        let (_dir, mut wal) = create_wal();
+        for (ts, (key, value)) in WAL_RECORDS.iter().enumerate() {
+            let record = match value {
+                Some(v) => WalRecordType::Insertion(key, v),
+                None => WalRecordType::Deletion(key),
+            };
+            wal.record_to_wal(record, ts as u64).unwrap();
+        }
+        wal.sync().unwrap(); // to pass the test
+        flip_bit_at(&wal.path, 0); // bit of first tag is flipped
+        let replay = WAL::build_avl_from_wal(&wal.path, MAX_MEMTABLE_THRESHOLD).unwrap();
+        assert!(matches!(
+            replay.replay_state,
+            WalReplayState::PartialError(DbError::DataCorrupted(DataCorruptedErr {
+                reason: CorruptionType::RecordTypeCorrupted { found: _ },
+                ..
+            }))
+        ));
+        assert_eq!(replay.records_recovered, 0); // corrupted the first record
+    }
+}

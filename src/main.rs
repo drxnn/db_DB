@@ -9,13 +9,6 @@ mod lsm;
 mod manifest;
 mod memtable;
 mod sstable;
+mod test_utils;
 mod wal;
 fn main() {}
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use tempfile::{tempdir, tempfile};
-// // TODO: test everything
-
-// }

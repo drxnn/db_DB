@@ -499,14 +499,14 @@ impl Footer {
 #[cfg(test)]
 mod tests {
 
-    use std::{assert_eq, matches};
+    use std::{assert_eq, format, matches};
 
     use super::*;
 
     // test sstables methods, then make create a valid sst file and load it, then test the fields are correct
     // then flip a bit in crcs to make sure we throw err
     use std::fs::{self, OpenOptions};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use tempfile::{TempDir, tempdir};
 
@@ -516,34 +516,51 @@ mod tests {
     };
 
     use crate::memtable::AVL;
+    use crate::test_utils::flip_bit_at;
+    const RECORDS: &[(&[u8], Option<&[u8]>)] = &[
+        (b"mango", Some(b"yellow")),
+        (b"apple", Some(b"red")),
+        (b"cherry", Some(b"dark red")),
+        (b"banana", Some(b"yellow")),
+        (b"apple", Some(b"green")), // overwrite newer value wins
+        (b"cherry", None),          // delete of an existing key
+        (b"kiwi", None),            // delete of a key we never put
+        (b"0-never-put", None),     // a tombstone that is also the smallest key()
+        (b"a", Some(b"prefix of apple")),
+        (b"app", Some(b"also a prefix")),
+        (b"empty-value", Some(b"")), // empty value, which is not a delete
+        (
+            b"zebra-this-key-is-deliberately-longer-than-the-57-byte-sst-trailer",
+            Some(b"long"),
+        ),
+        (b"banana", None),
+        (b"banana", Some(b"back again")),
+    ];
 
     fn write_sst() -> (TempDir, PathBuf) {
         let dir = tempdir().unwrap();
         let mut memtable = AVL::new(MAX_MEMTABLE_THRESHOLD);
-        const RECORDS: &[(&[u8], Option<&[u8]>)] = &[
-            (b"mango", Some(b"yellow")),
-            (b"apple", Some(b"red")),
-            (b"cherry", Some(b"dark red")),
-            (b"banana", Some(b"yellow")),
-            (b"apple", Some(b"green")), // overwrite newer value wins
-            (b"cherry", None),          // delete of an existing key
-            (b"kiwi", None),            // delete of a key we never put
-            (b"0-never-put", None),     // a tombstone that is also the smallest key()
-            (b"a", Some(b"prefix of apple")),
-            (b"app", Some(b"also a prefix")),
-            (b"empty-value", Some(b"")), // empty value, which is not a delete
-            (
-                b"zebra-this-key-is-deliberately-longer-than-the-57-byte-sst-trailer",
-                Some(b"long"),
-            ),
-            (b"banana", None),
-            (b"banana", Some(b"back again")),
-        ];
+
         for (ts, (key, value)) in RECORDS.iter().enumerate() {
             match value {
                 Some(v) => memtable.put(key, v, ts as u64),
                 None => memtable.delete(key, ts as u64),
             }
+        }
+        let (_, path) = memtable.sync_avl(dir.path(), 10).unwrap().unwrap();
+        (dir, path)
+    }
+
+    fn write_sst_with_multiple_data_blocks() -> (TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let mut memtable = AVL::new(MAX_MEMTABLE_THRESHOLD);
+
+        for i in 0..1000_u64 {
+            memtable.put(
+                format!("key{i:05}").as_bytes(),
+                format!("value{i:0100}").as_bytes(),
+                i,
+            );
         }
         let (_, path) = memtable.sync_avl(dir.path(), 10).unwrap().unwrap();
         (dir, path)
@@ -570,7 +587,8 @@ mod tests {
     }
 
     #[test]
-    // flip for all metadata, then flip random recods
+    // flip for all metadata, then flip random records
+    // TODO: use helpers here
     fn flipping_bit_in_sst_footer_crc_fails_to_load_sst() {
         let (dir, path_to_sst) = write_sst();
         let f = OpenOptions::new()
@@ -580,14 +598,8 @@ mod tests {
             .unwrap();
         let file_len = f.metadata().unwrap().len();
 
-        let mut footer_crc = [0u8; 4];
-        let _ = f.read_exact_at(
-            &mut footer_crc,
-            file_len - (FOOTER_LEN - FOOTER_FIELDS_CRC_START) as u64,
-        );
-        footer_crc[2] ^= 0x01;
-        let _ = f.write_all_at(
-            &footer_crc,
+        flip_bit_at(
+            &path_to_sst,
             file_len - (FOOTER_LEN - FOOTER_FIELDS_CRC_START) as u64,
         );
 
@@ -612,14 +624,8 @@ mod tests {
             .unwrap();
         let file_len = f.metadata().unwrap().len();
 
-        let mut bloom_crc = [0u8; 4];
-        let _ = f.read_exact_at(
-            &mut bloom_crc,
-            file_len - (FOOTER_LEN - FOOTER_BLOOM_CRC_START) as u64,
-        );
-        bloom_crc[2] ^= 0x01;
-        let _ = f.write_all_at(
-            &bloom_crc,
+        flip_bit_at(
+            &path_to_sst,
             file_len - (FOOTER_LEN - FOOTER_BLOOM_CRC_START) as u64,
         );
 
@@ -636,19 +642,20 @@ mod tests {
             .unwrap();
         let file_len = f.metadata().unwrap().len();
 
-        let mut min_max = [0u8; 4];
-        let _ = f.read_exact_at(
-            &mut min_max,
-            file_len - (FOOTER_LEN - FOOTER_MIN_MAX_CRC_START) as u64,
-        );
-        min_max[2] ^= 0x01;
-        let _ = f.write_all_at(
-            &min_max,
+        flip_bit_at(
+            &path_to_sst,
             file_len - (FOOTER_LEN - FOOTER_MIN_MAX_CRC_START) as u64,
         );
 
         let loaded_ss = SSTable::load(&path_to_sst).unwrap();
-        assert!(loaded_ss.min_max_keys.is_some()) // even though we had a bad crc, we rebuilt it
+        assert!(loaded_ss.min_max_keys.is_some());
+        assert_eq!(
+            loaded_ss.min_max_keys,
+            Some((
+                b"0-never-put".to_vec(),
+                b"zebra-this-key-is-deliberately-longer-than-the-57-byte-sst-trailer".to_vec(),
+            ))
+        );
     }
     #[test]
     fn flipping_bit_in_sst_sparse_crc_fails_to_load_sst() {
@@ -660,14 +667,20 @@ mod tests {
             .unwrap();
         let file_len = f.metadata().unwrap().len();
 
-        let mut footer_crc = [0u8; 4];
-        let _ = f.read_exact_at(
-            &mut footer_crc,
-            file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
-        );
-        footer_crc[2] ^= 0x01;
-        let _ = f.write_all_at(
-            &footer_crc,
+        // let mut footer_crc = [0u8; 4];
+        // f.read_exact_at(
+        //     &mut footer_crc,
+        //     file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
+        // )
+        // .unwrap();
+        // footer_crc[2] ^= 0x01;
+        // f.write_all_at(
+        //     &footer_crc,
+        //     file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
+        // )
+        // .unwrap();
+        flip_bit_at(
+            &path_to_sst,
             file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
         );
 
@@ -681,5 +694,103 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+
+    fn flipping_bit_on_a_record_returns_crc_mismatch_when_search() {
+        let (dir, path_to_sst) = write_sst();
+        let sstable = SSTable::load(&path_to_sst).unwrap();
+        // flipping a random bit in any of the records will fail here since all the test records are in one data block
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path_to_sst)
+            .unwrap();
+
+        let mut byte = [0u8; 1];
+        f.read_exact_at(&mut byte, 15).unwrap();
+        byte[0] ^= 0x01;
+        f.write_all_at(&byte, 15).unwrap();
+        assert!(matches!(
+            sstable.search_kv_in_sstable(b"banana"),
+            Err(DbError::DataCorrupted(DataCorruptedErr {
+                reason: CorruptionType::CrcMismatch {
+                    mismatch_type: CrcType::DataBlock,
+                    ..
+                },
+                ..
+            }))
+        ))
+    }
+    #[test]
+    fn every_key_returns_its_latest_state() {
+        let (_dir, path_to_sst) = write_sst();
+        let sst = SSTable::load(&path_to_sst).unwrap();
+
+        let expected: &[(&[u8], Lookup)] = &[
+            (b"0-never-put", Deleted),
+            (b"a", Found(b"prefix of apple".to_vec())),
+            (b"app", Found(b"also a prefix".to_vec())),
+            (b"apple", Found(b"green".to_vec())),
+            (b"banana", Found(b"back again".to_vec())),
+            (b"cherry", Deleted),
+            (b"empty-value", Found(Vec::new())),
+            (b"kiwi", Deleted),
+            (b"mango", Found(b"yellow".to_vec())),
+            (
+                b"zebra-this-key-is-deliberately-longer-than-the-57-byte-sst-trailer",
+                Found(b"long".to_vec()),
+            ),
+            (b"", Absent),
+            (b"aa", Absent),
+            (b"b", Absent),
+            (b"zzz", Absent),
+        ];
+        for (key, expected_result) in expected {
+            assert_eq!(&sst.search_kv_in_sstable(key).unwrap(), expected_result);
+        }
+    }
+
+    #[test]
+    fn searching_sparse_index_return_correct_data_block_for_key() {
+        let (_dir, path_to_sst) = write_sst_with_multiple_data_blocks();
+        let sst = SSTable::load(&path_to_sst).unwrap();
+        let blocks = &sst.sparse_index;
+        // for each block, first_key comes first
+        assert_eq!(sst.binary_search_sparse_index(b"a"), None); // doesnt exist
+
+        // (1, 20, 40, 60)
+        // 25 -> index 1
+        // starting backwards, can always check if key_we_are_looking_for >= first_key_in_block
+        for i in 0..1000_u64 {
+            let key = &format!("key{i:05}").into_bytes();
+            let (offset, length) = blocks
+                .iter()
+                .rev()
+                .find(|(first_key, _, _)| key >= first_key)
+                .map(|(_, offset, length)| (*offset, *length))
+                .unwrap();
+
+            assert_eq!(
+                sst.binary_search_sparse_index(key).unwrap(),
+                (offset, length)
+            )
+        }
+    }
+
+    #[test]
+    fn should_search_sstable_returns_correct_answers() {
+        let (_dir, path_to_sst) = write_sst_with_multiple_data_blocks();
+        let sst = SSTable::load(&path_to_sst).unwrap();
+
+        for i in 0..1000_u64 {
+            assert!(
+                sst.should_search_sstable_file(format!("key{i:05}").as_bytes()),
+                "key{i:05}"
+            );
+        }
+        assert!(!sst.should_search_sstable_file("key10001".as_bytes())); // more than max
+        assert!(!sst.should_search_sstable_file("jey00001".as_bytes())); // less than mn
     }
 }
