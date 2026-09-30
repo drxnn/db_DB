@@ -30,7 +30,7 @@ struct AvlEntry {
     timestamp: u64,
 }
 #[derive(PartialEq, Clone, Debug)]
-struct Node {
+pub struct Node {
     // (Done): Node should actually carry timestamp, exactly at the time a Node is created
     // Right now we get the timestamp when we serialize the kv which is basically called for everynode as we are flushing
     entry: AvlEntry,
@@ -283,7 +283,7 @@ impl AVL {
         self.root = self.insert(root, node);
     }
 
-    fn get_min_node(node: &Option<Box<Node>>) -> Option<&Node> {
+    pub fn get_min_node(node: &Option<Box<Node>>) -> Option<&Node> {
         let mut curr = node.as_ref()?;
         while let Some(n) = curr.left.as_ref() {
             curr = n
@@ -300,31 +300,6 @@ impl AVL {
 
         Some(curr.as_ref()) // 
     }
-
-    // pub fn serialize_sstable_footer(
-    //     offset: u64,
-    //     min_key: &[u8],
-    //     max_key: &[u8],
-    //     sizeof_si: u64,
-    //     sizeof_bf: u64,
-    //     level: u8,
-    // ) -> Vec<u8> {
-    //     let mut footer: Vec<u8> = Vec::new();
-
-    //     footer.extend_from_slice(min_key);
-    //     footer.extend_from_slice(max_key);
-
-    //     footer.extend_from_slice(&offset.to_le_bytes());
-    //     footer.extend_from_slice(&sizeof_si.to_le_bytes());
-    //     footer.extend_from_slice(&sizeof_bf.to_le_bytes());
-    //     footer.extend_from_slice(&(min_key.len() as u64).to_le_bytes());
-    //     footer.extend_from_slice(&(max_key.len() as u64).to_le_bytes());
-    //     footer.extend_from_slice(&level.to_le_bytes()); // Level of sstable, starts at L0
-    //     // entire footer: | sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) |
-    //     // | sizeof(maxkey) | level | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc | metadata_crc(4 bytes) |
-
-    //     footer
-    // }
 
     fn build_sstable_recursive(
         &self,
@@ -468,5 +443,103 @@ impl AVL {
             let _ = fs::remove_file(&tmp_path_for_err_case);
             DbError::SyncFail(Box::new(err), tmp_path_for_err_case)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_eq;
+
+    use super::*;
+
+    // use crate::hlc::Hlc;
+    fn populated_memtable() -> AVL {
+        let records_to_add = [("a", "a1"), ("ab", "ab2"), ("longest", "longest123")];
+
+        let mut memtable = AVL::new(1024);
+        for (i, (k, v)) in records_to_add.iter().enumerate() {
+            memtable.put(k.as_bytes(), v.as_bytes(), i as u64);
+        }
+
+        memtable
+    }
+
+    fn populated_numbers_memtable() -> AVL {
+        let records_to_add = [
+            (1_u64.to_le_bytes(), 100_u64.to_le_bytes()),
+            (2_u64.to_le_bytes(), 200_u64.to_le_bytes()),
+            (3_u64.to_le_bytes(), 300_u64.to_le_bytes()),
+        ];
+        let mut memtable = AVL::new(1024);
+        for (i, (k, v)) in records_to_add.iter().enumerate() {
+            memtable.put(k, v, i as u64);
+        }
+        memtable
+    }
+
+    #[test]
+    pub fn puts_records() {
+        let memtable = populated_memtable();
+
+        assert_eq!(memtable.get(b"a"), Found("a1".into()));
+        assert_eq!(memtable.get(b"ab"), Found("ab2".into()));
+        assert_eq!(memtable.get(b"longest"), Found("longest123".into()));
+        assert_eq!(memtable.size, 3);
+    }
+
+    #[test]
+    fn deletes_record() {
+        let mut populated_mem = populated_memtable();
+        populated_mem.delete(b"a", 4);
+        assert_eq!(populated_mem.get(b"a"), Lookup::Deleted)
+    }
+    #[test]
+    fn gets_min_node() {
+        let mut memtable = populated_memtable();
+        let root = memtable.root.take();
+        let min = AVL::get_min_node(&root);
+        assert_eq!(min.unwrap().entry.key, b"a");
+    }
+
+    #[test]
+    fn gets_max_node() {
+        let mut memtable = populated_memtable();
+        let root = memtable.root.take();
+        let min = AVL::get_max_node(&root);
+        assert_eq!(min.unwrap().entry.key, b"longest");
+    }
+
+    #[test]
+    fn overwrites_key() {
+        let mut memtable = populated_memtable();
+        assert_eq!(memtable.get(b"a"), Found("a1".into()));
+        memtable.put(b"a", b"a1_overwrite", 5);
+        assert_eq!(memtable.get(b"a"), Found("a1_overwrite".into()));
+    }
+
+    #[test]
+    fn get_key_that_does_not_exist_returns_absent() {
+        let memtable = populated_memtable();
+        assert_eq!(memtable.get(b"nothere"), Absent)
+    }
+    #[test]
+    fn deleting_key_that_does_not_exist_inserts_record() {
+        let mut memtable = populated_memtable();
+        memtable.delete(b"notherebutinserts", 6);
+        assert_eq!(memtable.size, 4);
+        assert_eq!(memtable.get(b"notherebutinserts"), Deleted)
+    }
+
+    #[test]
+    fn empty_tree_is_empty() {
+        let mut memtable = AVL::new(1024);
+        assert_eq!(memtable.size, 0);
+        assert_eq!(memtable.size_in_bytes, 0);
+        assert_eq!(memtable.root.take(), None);
+    }
+
+    #[test]
+    fn test_each_rotation_case() {
+        let memtable = populated_numbers_memtable();
     }
 }

@@ -34,6 +34,7 @@ pub(crate) enum SyncConfig {
     Always,     // Ddurable
 }
 
+#[derive(PartialEq, Debug)]
 pub enum Lookup {
     Found(Vec<u8>),
     Deleted,
