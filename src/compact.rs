@@ -20,7 +20,7 @@ use crate::errors::CompactionErr::{self};
 
 use crate::constants::{
     BLOOM_BITS_PER_KEY, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
-    FOOTER_FIXED_LEN, MAX_SST_SIZE, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
+    MAX_SST_SIZE, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
 };
 use crate::errors::CrcType;
 use crate::helpers::{
@@ -28,8 +28,8 @@ use crate::helpers::{
     get_positions_from_hashed_key, hash_key, read_exact_or_truncated,
 };
 use crate::hlc::Hlc;
-use crate::memtable::AVL;
-use crate::sstable::{BloomFilter, SparseIndex, SsTableDataBlock};
+
+use crate::sstable::{BloomFilter, Footer, SparseIndex, SsTableDataBlock};
 use crate::{
     constants::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE},
     errors::{DataCorruptedErr, DbError, Result},
@@ -510,18 +510,24 @@ impl CompactionJob {
             bloom_filter.set_bits(positions);
         });
 
-        // Level needs to be provided
-        let footer = AVL::serialize_sstable_footer(
-            sst_finalizer.offset,
-            &min_k,
-            &max_k,
-            sst_finalizer.sparse_index.index_entries.len() as u64,
-            (bloom_filter.bits.len() * U64_LEN) as u64,
-            sst_finalizer.level,
-        );
+        let footer = Footer {
+            sparse_index_offset: sst_finalizer.offset,
+            sparse_index_len: sst_finalizer.sparse_index.index_entries.len() as u64,
+            bloom_len: (bloom_filter.bits.len() * U64_LEN) as u64,
+            min_key_len: min_k.len() as u64,
+            max_key_len: max_k.len() as u64,
+            level: sst_finalizer.level,
+        };
+        let footer = footer.serialize();
+
+        let footer_crc = CRC32.compute_crc_data_block(&footer);
+        let mut min_max_digest = CRC32.digest();
+        min_max_digest.update(&min_k);
+        min_max_digest.update(&max_k);
+        let min_max_crc = min_max_digest.finalize();
+
         // Repeating myself below with the boundary checks, put in a function
-        let footer_crc = CRC32.compute_crc_data_block(&footer[footer.len() - FOOTER_FIXED_LEN..]);
-        let min_max_crc = CRC32.compute_crc_data_block(&footer[..footer.len() - FOOTER_FIXED_LEN]);
+
         let sparse_crc = CRC32.compute_crc_data_block(&sst_finalizer.sparse_index.index_entries);
 
         sst_finalizer
@@ -534,6 +540,9 @@ impl CompactionJob {
             sst_finalizer.writer.write_all(&word.to_le_bytes())?;
         }
         let bloom_crc = bloom_digest.finalize();
+        sst_finalizer.writer.write_all(&min_k)?;
+        sst_finalizer.writer.write_all(&max_k)?;
+
         sst_finalizer.writer.write_all(&footer)?;
         sst_finalizer.writer.write_all(&sparse_crc.to_le_bytes())?;
         sst_finalizer.writer.write_all(&bloom_crc.to_le_bytes())?;

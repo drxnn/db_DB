@@ -7,17 +7,17 @@ use std::{
 
 use crate::{
     constants::{
-        BLOOM_BITS_PER_KEY, FOOTER_FIXED_LEN, KEY_MAX_BYTES_SIZE, RECORD_HEADER_LEN,
-        TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN, VALUE_MAX_BYTES_SIZE,
+        BLOOM_BITS_PER_KEY, KEY_MAX_BYTES_SIZE, RECORD_HEADER_LEN, TOMBSTONE_DELETED,
+        TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN, VALUE_MAX_BYTES_SIZE,
     },
     errors::{DbError, InvalidMemtableInput, Result},
     helpers::{CRC32, create_new_data_file, get_hashed_key_positions},
     lsm::Lookup::{self, Absent, Deleted, Found},
-    sstable::{BloomFilter, SparseIndex, SsTableDataBlock},
+    sstable::{BloomFilter, Footer, SparseIndex, SsTableDataBlock},
 };
 
 pub struct AVL {
-    pub root: Option<Box<Node>>,
+    root: Option<Box<Node>>,
     pub threshold: u64,
     size: u64,
     pub size_in_bytes: u64,
@@ -301,30 +301,30 @@ impl AVL {
         Some(curr.as_ref()) // 
     }
 
-    pub fn serialize_sstable_footer(
-        offset: u64,
-        min_key: &[u8],
-        max_key: &[u8],
-        sizeof_si: u64,
-        sizeof_bf: u64,
-        level: u8,
-    ) -> Vec<u8> {
-        let mut footer: Vec<u8> = Vec::new();
+    // pub fn serialize_sstable_footer(
+    //     offset: u64,
+    //     min_key: &[u8],
+    //     max_key: &[u8],
+    //     sizeof_si: u64,
+    //     sizeof_bf: u64,
+    //     level: u8,
+    // ) -> Vec<u8> {
+    //     let mut footer: Vec<u8> = Vec::new();
 
-        footer.extend_from_slice(min_key);
-        footer.extend_from_slice(max_key);
+    //     footer.extend_from_slice(min_key);
+    //     footer.extend_from_slice(max_key);
 
-        footer.extend_from_slice(&offset.to_le_bytes());
-        footer.extend_from_slice(&sizeof_si.to_le_bytes());
-        footer.extend_from_slice(&sizeof_bf.to_le_bytes());
-        footer.extend_from_slice(&(min_key.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&(max_key.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&level.to_le_bytes()); // Level of sstable, starts at L0
-        // entire footer: | sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) |
-        // | sizeof(maxkey) | level | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc | metadata_crc(4 bytes) |
+    //     footer.extend_from_slice(&offset.to_le_bytes());
+    //     footer.extend_from_slice(&sizeof_si.to_le_bytes());
+    //     footer.extend_from_slice(&sizeof_bf.to_le_bytes());
+    //     footer.extend_from_slice(&(min_key.len() as u64).to_le_bytes());
+    //     footer.extend_from_slice(&(max_key.len() as u64).to_le_bytes());
+    //     footer.extend_from_slice(&level.to_le_bytes()); // Level of sstable, starts at L0
+    //     // entire footer: | sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) |
+    //     // | sizeof(maxkey) | level | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc | metadata_crc(4 bytes) |
 
-        footer
-    }
+    //     footer
+    // }
 
     fn build_sstable_recursive(
         &self,
@@ -416,21 +416,23 @@ impl AVL {
 
                 file_offset += full.bytes.get_ref().len() as u64; // length here is the start of sparse_index // 
             }
-            let footer = Self::serialize_sstable_footer(
-                file_offset,
-                min_k,
-                max_k,
-                sparse_index.index_entries.len() as u64,
-                (bloom_filter.bits.len() * U64_LEN) as u64, // multiply by 8, needed for reading the u8s during load
-                0_u8,                                       // LEVEL 0
-            );
 
-            let footer_len = footer.len();
+            let footer = Footer {
+                sparse_index_offset: file_offset,
+                sparse_index_len: sparse_index.index_entries.len() as u64,
+                bloom_len: (bloom_filter.bits.len() * U64_LEN) as u64,
+                min_key_len: min_k.len() as u64,
+                max_key_len: max_k.len() as u64,
+                level: 0 as u8,
+            };
+            let footer = footer.serialize();
 
-            let footer_crc =
-                CRC32.compute_crc_data_block(&footer[footer_len - FOOTER_FIXED_LEN..footer_len]);
-            let min_max_crc =
-                CRC32.compute_crc_data_block(&footer[..footer_len - FOOTER_FIXED_LEN]);
+            let footer_crc = CRC32.compute_crc_data_block(&footer);
+            let mut min_max_digest = CRC32.digest();
+            min_max_digest.update(min_k);
+            min_max_digest.update(max_k);
+            let min_max_crc = min_max_digest.finalize();
+
             let sparse_crc = CRC32.compute_crc_data_block(&sparse_index.index_entries);
 
             writer.write_all(&sparse_index.index_entries)?;
@@ -443,6 +445,8 @@ impl AVL {
             }
             let bloom_crc = bloom_digest.finalize();
 
+            writer.write_all(min_k)?;
+            writer.write_all(max_k)?;
             writer.write_all(&footer)?;
             writer.write_all(&sparse_crc.to_le_bytes())?;
             writer.write_all(&bloom_crc.to_le_bytes())?;

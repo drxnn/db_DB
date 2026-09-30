@@ -1,11 +1,14 @@
 use std::fs::{File, OpenOptions, remove_file};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::constants::{TAG_DELETION, TAG_INSERTION};
-use crate::errors::{DbError, Result};
-use crate::helpers::CRC32;
+use crate::constants::{
+    CRC_LEN, KEY_MAX_BYTES_SIZE, TAG_DELETION, TAG_INSERTION, TAG_LEN, U64_LEN,
+    VALUE_MAX_BYTES_SIZE,
+};
+use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError, Result};
+use crate::helpers::{CRC32, check_crc, read_exact_or_truncated};
 use crate::lsm::SyncConfig::{self, Always, Every};
 
 use crate::memtable::AVL;
@@ -111,6 +114,161 @@ impl WAL {
             }
             None => Err(DbError::WalNotFound),
         }
+    }
+    pub(crate) fn build_avl_from_wal(
+        path: &PathBuf,
+        memtable_threshold: u64,
+    ) -> Result<WalToMemtableReplay> {
+        let mut memtable = AVL::new(memtable_threshold);
+        let mut curr_offset: u64 = 0;
+        let mut records_recovered = 0;
+        let mut most_recent_hlc: Option<u64> = None;
+
+        let wal_f = File::open(path)?;
+
+        let file_len = wal_f.metadata()?.len();
+
+        let mut reader = BufReader::new(&wal_f);
+
+        let mut type_of_record: [u8; TAG_LEN] = [0u8; TAG_LEN];
+
+        let mut ksz = [0u8; U64_LEN];
+        let mut tstamp = [0u8; U64_LEN];
+        let mut vsz = [0u8; U64_LEN];
+        let mut crc = [0u8; CRC_LEN];
+        let mut pos: u64 = 0;
+
+        let outcome = (|| -> Result<()> {
+            while pos < file_len {
+                // We should read records up until a truncated record or a corrupted record, then we stop
+                read_exact_or_truncated(&mut reader, &mut type_of_record, curr_offset, path)?;
+                curr_offset += TAG_LEN as u64;
+                let type_tag = type_of_record[0];
+
+                match type_tag {
+                    TAG_DELETION => {
+                        //  TAG_DELETION handle  [ tstamp(8) | ksz(8) | key(sizeof ksz ) |crc (4 bytes) ]
+                        read_exact_or_truncated(&mut reader, &mut tstamp, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+                        read_exact_or_truncated(&mut reader, &mut ksz, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+
+                        let key_size = u64::from_le_bytes(ksz);
+
+                        if key_size > KEY_MAX_BYTES_SIZE {
+                            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                                offset: pos,
+                                file_path: path.to_path_buf(),
+                                reason: CorruptionType::Other(format!(
+                                    "record size overflow: ksz={key_size}"
+                                )),
+                            }));
+                        }
+                        let mut key_buffer = vec![0u8; key_size as usize];
+
+                        read_exact_or_truncated(&mut reader, &mut key_buffer, curr_offset, path)?;
+                        curr_offset += key_size;
+
+                        let crc_data_block =
+                            [type_of_record.as_slice(), &tstamp, &ksz, &key_buffer].concat();
+                        let crc_to_check = CRC32.compute_crc_data_block(&crc_data_block);
+
+                        read_exact_or_truncated(&mut reader, &mut crc, curr_offset, path)?;
+                        curr_offset += CRC_LEN as u64;
+
+                        let crc_from_buff = u32::from_le_bytes(crc);
+
+                        check_crc(crc_to_check, crc_from_buff, pos, path, CrcType::WalRecord)?;
+                        let ts = u64::from_le_bytes(tstamp);
+                        most_recent_hlc = Some(most_recent_hlc.unwrap_or(0).max(ts));
+
+                        pos = reader.stream_position()?;
+                        memtable.delete(&key_buffer, ts);
+                        records_recovered += 1;
+                    }
+                    TAG_INSERTION => {
+                        read_exact_or_truncated(&mut reader, &mut tstamp, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+                        read_exact_or_truncated(&mut reader, &mut ksz, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+                        read_exact_or_truncated(&mut reader, &mut vsz, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+
+                        let key_size = u64::from_le_bytes(ksz);
+                        let val_size = u64::from_le_bytes(vsz);
+
+                        if key_size > KEY_MAX_BYTES_SIZE || val_size > VALUE_MAX_BYTES_SIZE {
+                            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                                offset: pos,
+                                file_path: path.to_path_buf(),
+                                reason: CorruptionType::Other(format!(
+                                    "record size overflow: ksz={key_size} vsz={val_size}"
+                                )),
+                            }));
+                        }
+                        let mut key_buffer = vec![0u8; key_size as usize];
+                        let mut val_buffer = vec![0u8; val_size as usize];
+
+                        read_exact_or_truncated(&mut reader, &mut key_buffer, curr_offset, path)?;
+                        curr_offset += key_size;
+
+                        read_exact_or_truncated(&mut reader, &mut val_buffer, curr_offset, path)?;
+                        curr_offset += val_size;
+
+                        let crc_data_block = [
+                            type_of_record.as_slice(),
+                            &tstamp,
+                            &ksz,
+                            &vsz,
+                            &key_buffer,
+                            &val_buffer,
+                        ]
+                        .concat();
+                        let crc_to_check = CRC32.compute_crc_data_block(&crc_data_block);
+
+                        read_exact_or_truncated(&mut reader, &mut crc, curr_offset, path)?;
+                        curr_offset += CRC_LEN as u64;
+
+                        let crc_from_buff = u32::from_le_bytes(crc);
+
+                        check_crc(crc_to_check, crc_from_buff, pos, path, CrcType::WalRecord)?;
+
+                        let ts = u64::from_le_bytes(tstamp);
+                        most_recent_hlc = Some(most_recent_hlc.unwrap_or(0).max(ts));
+
+                        pos = reader.stream_position()?;
+
+                        memtable.put(&key_buffer, &val_buffer, ts);
+                        records_recovered += 1;
+
+                        // TAG_INSERTION handle tstamp | ksz | vsz | key | value |crc (4 bytes)
+                    }
+                    _ => {
+                        // corrupt
+                        return Err(DbError::DataCorrupted(DataCorruptedErr {
+                            reason: CorruptionType::RecordTypeCorrupted { found: type_tag },
+                            offset: curr_offset - TAG_LEN as u64,
+                            file_path: path.to_path_buf(),
+                        }));
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        let replay_state = match outcome {
+            Ok(()) => WalReplayState::Clean,
+            Err(err @ DbError::DataCorrupted(_)) => WalReplayState::PartialError(err),
+            Err(e) => return Err(e),
+        };
+
+        Ok(WalToMemtableReplay {
+            memtable,
+            records_recovered,
+            valid_bytes: pos, // pos is only updated when we read a valid record
+            most_recent_hlc,
+            replay_state,
+        })
     }
 }
 

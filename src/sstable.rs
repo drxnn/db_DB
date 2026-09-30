@@ -7,20 +7,23 @@ pub use data_block::SsTableDataBlock;
 pub use sparse_index::SparseIndex;
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::constants::{
-    BLOOM_WORD_BITS, CRC_LEN, FOOTER_BLOOM_LEN_START, FOOTER_FIXED_LEN, FOOTER_LEN,
-    FOOTER_LEVEL_START, FOOTER_MAX_KEY_LEN_START, FOOTER_MIN_KEY_LEN_START,
-    FOOTER_SPARSE_LEN_START, FOOTER_SPARSE_OFFSET_START, RECORD_HEADER_LEN, RECORD_KSZ_OFFSET,
-    RECORD_VSZ_OFFSET, SST_LEVEL_COUNT, U64_LEN,
+    BLOOM_WORD_BITS, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE, FOOTER_BLOOM_LEN_START, FOOTER_FIXED_LEN,
+    FOOTER_LEN, FOOTER_LEVEL_START, FOOTER_MAX_KEY_LEN_START, FOOTER_MIN_KEY_LEN_START,
+    FOOTER_SPARSE_LEN_START, FOOTER_SPARSE_OFFSET_START, LEVEL_LEN, RECORD_HEADER_LEN,
+    RECORD_KSZ_OFFSET, RECORD_TOMBSTONE_OFFSET, RECORD_VSZ_OFFSET, SST_LEVEL_COUNT,
+    TOMBSTONE_DELETED, U64_LEN,
 };
 use crate::errors::CorruptionType::{self, Other, SstLevelMalformed};
 use crate::errors::{CrcType, DataCorruptedErr, DbError, Result};
-use crate::helpers::{CRC32, check_crc, read_range, read_u8, read_u64};
+use crate::helpers::{CRC32, check_crc, get_hashed_key_positions, read_range, read_u8, read_u64};
+use crate::lsm::Lookup::{self, Absent, Deleted, Found};
+use std::cmp::Ordering as CmpOrdering;
 
 pub struct SSTable {
     pub(crate) id: u64,
@@ -89,39 +92,31 @@ impl SSTable {
             CrcType::SstFooterMetadata,
         )?;
 
-        let level = read_u8(&footer, FOOTER_LEVEL_START)?;
+        let footer = Footer::parse(&footer)?;
 
-        if level as usize >= SST_LEVEL_COUNT {
+        if footer.level as usize >= SST_LEVEL_COUNT {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
                 offset: file_metadata.len() - (FOOTER_LEN - FOOTER_LEVEL_START) as u64, // - 17
                 file_path: path.to_path_buf(),
-                reason: SstLevelMalformed(level as usize),
+                reason: SstLevelMalformed(footer.level as usize),
             }));
         }
 
-        let sparse_index_offset = read_u64(&footer, FOOTER_SPARSE_OFFSET_START)?;
-
-        let size_of_sparse_index = read_u64(&footer, FOOTER_SPARSE_LEN_START)?;
-
-        let size_of_bloom_filter = read_u64(&footer, FOOTER_BLOOM_LEN_START)?; // byte count of vector
-        let size_of_min_key = read_u64(&footer, FOOTER_MIN_KEY_LEN_START)?;
-
-        let size_of_max_key = read_u64(&footer, FOOTER_MAX_KEY_LEN_START)?;
-
-        let full_data_length = size_of_sparse_index
-            .checked_add(size_of_bloom_filter)
-            .and_then(|x| x.checked_add(size_of_min_key))
-            .and_then(|x| x.checked_add(size_of_max_key))
+        let full_data_length = footer
+            .sparse_index_len
+            .checked_add(footer.bloom_len)
+            .and_then(|x| x.checked_add(footer.min_key_len))
+            .and_then(|x| x.checked_add(footer.max_key_len))
             .ok_or({
                 DbError::DataCorrupted(DataCorruptedErr {
-                    offset: sparse_index_offset,
+                    offset: footer.sparse_index_offset,
                     file_path: path.to_path_buf(),
                     reason: CorruptionType::MetadataSizeOverflow {
                         sizes: [
-                            size_of_sparse_index,
-                            size_of_bloom_filter,
-                            size_of_min_key,
-                            size_of_max_key,
+                            footer.sparse_index_len,
+                            footer.bloom_len,
+                            footer.min_key_len,
+                            footer.max_key_len,
                         ],
                     },
                 })
@@ -131,7 +126,7 @@ impl SSTable {
         // TODO: have the helper function above work with different kinds of data_corruption // not just k/v record check
         if full_data_length > file_len {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
-                offset: sparse_index_offset,
+                offset: footer.sparse_index_offset,
                 file_path: path.to_path_buf(),
                 reason: CorruptionType::MetaDataSizeExceedsFileSize {
                     file_size: file_len,
@@ -141,24 +136,24 @@ impl SSTable {
         }
         let full_data_length = full_data_length as usize;
 
-        f.seek(SeekFrom::Start(sparse_index_offset))?;
+        f.seek(SeekFrom::Start(footer.sparse_index_offset))?;
         let mut full_sst_data = vec![0u8; full_data_length];
         f.read_exact(&mut full_sst_data)?;
-        let bloom_filter_start = size_of_sparse_index;
-        let bloom_filter_end = bloom_filter_start + size_of_bloom_filter;
+        let bloom_filter_start = footer.sparse_index_len;
+        let bloom_filter_end = bloom_filter_start + footer.bloom_len;
         let min_k_start = bloom_filter_end;
-        let min_k_end = min_k_start + size_of_min_key;
+        let min_k_end = min_k_start + footer.min_key_len;
         let max_k_start = min_k_end;
-        let max_k_end = max_k_start + size_of_max_key;
+        let max_k_end = max_k_start + footer.max_key_len;
 
         // let sparse_index: &[u8] = &full_sst_data[0..(size_of_sparse_index as usize)];
-        let sparse_index: &[u8] = read_range(&full_sst_data, 0, size_of_sparse_index as usize)?;
+        let sparse_index: &[u8] = read_range(&full_sst_data, 0, footer.sparse_index_len as usize)?;
         let sparse_index_crc_check = CRC32.compute_crc_data_block(sparse_index);
 
         check_crc(
             sparse_index_crc_check,
             sparse_index_crc_in_file,
-            sparse_index_offset,
+            footer.sparse_index_offset,
             path,
             CrcType::SparseIndex,
         )?;
@@ -227,7 +222,7 @@ impl SSTable {
             sparse_index: Arc::new(parsed_sparse_index),
             bloom_filter,
             corrupted: false,
-            level,
+            level: footer.level,
             currently_picked_for_compaction: false,
         };
         if sstable.min_max_keys.is_none() {
@@ -236,6 +231,134 @@ impl SSTable {
         Ok(sstable)
     }
 
+    pub(crate) fn should_search_sstable_file(&self, key: &[u8]) -> bool {
+        if let Some((min, max)) = &self.min_max_keys
+            && (key > max.as_slice() || key < min.as_slice())
+        {
+            return false;
+        }
+
+        if let Some(bloom_filter) = &self.bloom_filter {
+            let bf_bit_positions = get_hashed_key_positions(key, bloom_filter.num_bits as usize);
+            bloom_filter.check_bits(bf_bit_positions)
+        } else {
+            true // If we do not have a bloom filter, we just search the file without bloom filter optimization
+        }
+    }
+    pub(crate) fn search_kv_in_sstable(&self, key: &[u8]) -> Result<Lookup> {
+        let Some((offset, data_len)) = self.binary_search_sparse_index(key) else {
+            return Ok(Absent);
+        };
+
+        if data_len > DATA_BLOCK_MAX_BYTES_SIZE {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset,
+                file_path: self.file_path.clone(),
+                reason: CorruptionType::BufferExceedsMaxLength {
+                    size: data_len,
+                    max_size: DATA_BLOCK_MAX_BYTES_SIZE,
+                },
+            }));
+        }
+        let mut data_buffer = vec![0u8; data_len as usize];
+
+        let mut crc = [0u8; CRC_LEN];
+
+        let mut reader = BufReader::new(&self.file);
+
+        reader.seek(SeekFrom::Start(offset))?;
+
+        reader.read_exact(&mut data_buffer)?;
+
+        //
+        // we read CRC here because data_len above doesnt take into account the 4 bytes for crc
+        reader.read_exact(&mut crc)?;
+        let crc_from_buff = u32::from_le_bytes(crc);
+
+        let fresh_crc = CRC32.compute_crc_data_block(&data_buffer);
+
+        check_crc(
+            fresh_crc,
+            crc_from_buff,
+            offset,
+            &self.file_path,
+            CrcType::DataBlock,
+        )?;
+
+        let mut pos = 0;
+        while pos < data_buffer.len() {
+            if pos + RECORD_HEADER_LEN > data_buffer.len() {
+                return Err(DbError::DataCorrupted(DataCorruptedErr {
+                    offset: offset + pos as u64,
+                    file_path: self.file_path.clone(),
+                    reason: CorruptionType::Other(format!(
+                        "truncated record header at buffer position {} (buffer len {})",
+                        pos,
+                        data_buffer.len(),
+                    )),
+                }));
+            }
+
+            // its actually: [ tstamp(8) | ksz(8) | value_sz(8) |tombstone| key | value |  ]
+            let ksz = read_u64(&data_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
+
+            let vsz = read_u64(&data_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
+
+            let deleted = read_range(
+                &data_buffer,
+                pos + RECORD_TOMBSTONE_OFFSET,
+                pos + RECORD_HEADER_LEN,
+            )?[0];
+            // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
+            // check ksz and vsz doesnt overflow
+            let key_start = pos + RECORD_HEADER_LEN;
+
+            let val_end = key_start
+                .checked_add(ksz)
+                .and_then(|v| v.checked_add(vsz))
+                .ok_or_else(|| {
+                    DbError::DataCorrupted(DataCorruptedErr {
+                        offset: offset + pos as u64,
+                        file_path: self.file_path.clone(),
+                        reason: CorruptionType::Other(format!(
+                            "record size overflow: ksz={ksz}, vsz={vsz}"
+                        )),
+                    })
+                })?;
+
+            if val_end > data_buffer.len() {
+                return Err(DbError::DataCorrupted(DataCorruptedErr {
+                    offset: offset + pos as u64,
+                    file_path: self.file_path.clone(),
+                    reason: CorruptionType::LengthMismatch {
+                        expected: val_end,
+                        found: data_buffer.len(),
+                    },
+                }));
+            }
+
+            let val_start = key_start + ksz; // if val_end is safe then this is safe(no overflow)
+            let curr_key = read_range(&data_buffer, key_start, val_start)?;
+            // let curr_key = &data_buffer[key_start..val_start];
+            let value = read_range(&data_buffer, val_start, val_end)?;
+            // let value: &[u8] = &data_buffer[val_start..val_end];
+
+            match curr_key.cmp(key) {
+                CmpOrdering::Less => {
+                    pos = val_end;
+                    continue;
+                }
+                CmpOrdering::Equal => {
+                    if deleted == TOMBSTONE_DELETED {
+                        return Ok(Deleted);
+                    }
+                    return Ok(Found(value.to_vec()));
+                }
+                CmpOrdering::Greater => break,
+            }
+        }
+        Ok(Absent)
+    }
     pub(crate) fn binary_search_sparse_index(&self, key: &[u8]) -> Option<(u64, u64)> {
         // first u64 is the offset, the second is the datablock size
         if self.sparse_index.is_empty() {
@@ -329,5 +452,50 @@ impl SSTable {
         self.min_max_keys = Some((min_k.to_vec(), max_k.to_vec()));
 
         Ok(())
+    }
+}
+
+pub(crate) struct Footer {
+    pub(crate) sparse_index_offset: u64,
+    pub(crate) sparse_index_len: u64,
+    pub(crate) bloom_len: u64,
+    pub(crate) min_key_len: u64,
+    pub(crate) max_key_len: u64,
+    pub(crate) level: u8,
+}
+
+impl Footer {
+    pub(crate) fn serialize(&self) -> [u8; FOOTER_FIXED_LEN] {
+        let mut footer: [u8; FOOTER_FIXED_LEN] = [0u8; FOOTER_FIXED_LEN];
+
+        footer[FOOTER_SPARSE_OFFSET_START..FOOTER_SPARSE_LEN_START]
+            .copy_from_slice(&self.sparse_index_offset.to_le_bytes());
+
+        footer[FOOTER_SPARSE_LEN_START..FOOTER_BLOOM_LEN_START]
+            .copy_from_slice(&self.sparse_index_len.to_le_bytes());
+
+        footer[FOOTER_BLOOM_LEN_START..FOOTER_MIN_KEY_LEN_START]
+            .copy_from_slice(&self.bloom_len.to_le_bytes());
+
+        footer[FOOTER_MIN_KEY_LEN_START..FOOTER_MAX_KEY_LEN_START]
+            .copy_from_slice(&self.min_key_len.to_le_bytes());
+
+        footer[FOOTER_MAX_KEY_LEN_START..FOOTER_LEVEL_START]
+            .copy_from_slice(&self.max_key_len.to_le_bytes());
+
+        footer[FOOTER_LEVEL_START..FOOTER_FIXED_LEN].copy_from_slice(&self.level.to_le_bytes());
+
+        footer
+    }
+
+    pub(crate) fn parse(bytes: &[u8; FOOTER_FIXED_LEN]) -> Result<Footer> {
+        Ok(Footer {
+            sparse_index_offset: read_u64(bytes, FOOTER_SPARSE_OFFSET_START)?,
+            sparse_index_len: read_u64(bytes, FOOTER_SPARSE_LEN_START)?,
+            bloom_len: read_u64(bytes, FOOTER_BLOOM_LEN_START)?,
+            min_key_len: read_u64(bytes, FOOTER_MIN_KEY_LEN_START)?,
+            max_key_len: read_u64(bytes, FOOTER_MAX_KEY_LEN_START)?,
+            level: read_u8(bytes, FOOTER_LEVEL_START)?,
+        })
     }
 }

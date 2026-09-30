@@ -1,47 +1,29 @@
-use std::os::unix::fs::FileExt;
-
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, OpenOptions, remove_file, rename};
-use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File, remove_file, rename};
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+
 use std::sync::{Arc, RwLock, RwLockReadGuard};
-use std::thread::{JoinHandle, spawn};
-use std::time::{Duration, Instant};
-use std::{format, todo, unreachable};
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
 use crate::constants::{
-    BLOOM_WORD_BITS, CRC_LEN, DATA_BLOCK, DATA_BLOCK_MAX_BYTES_SIZE, FOOTER_BLOOM_LEN_START,
-    FOOTER_FIXED_LEN, FOOTER_LEN, FOOTER_LEVEL_START, FOOTER_MAX_KEY_LEN_START,
-    FOOTER_MIN_KEY_LEN_START, FOOTER_SPARSE_LEN_START, FOOTER_SPARSE_OFFSET_START,
     KEY_MAX_BYTES_SIZE, MAX_FLUSH_ATTEMPTS, MAX_FROZEN_MEMTABLES_LIMIT, MAX_MEMTABLE_THRESHOLD,
-    MAX_SST_SIZE, NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION, RECORD_HEADER_LEN, RECORD_KSZ_OFFSET,
-    RECORD_TOMBSTONE_OFFSET, RECORD_VSZ_OFFSET, SST_EXT, SST_LEVEL_COUNT, TAG_DELETION,
-    TAG_INSERTION, TAG_LEN, TMP_EXT, TOMBSTONE_DELETED, U64_LEN, VALUE_MAX_BYTES_SIZE, WAL_EXT,
+    MAX_SST_SIZE, NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION, RECORD_HEADER_LEN, SST_EXT,
+    SST_LEVEL_COUNT, TMP_EXT, VALUE_MAX_BYTES_SIZE, WAL_EXT,
 };
-
-use crate::errors::CorruptionType::{Other, SstLevelMalformed};
 
 use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidOptions, Result};
 use crate::flush::{FlushingManager, FlushingThreadResponse, FrozenMemtableInstance};
-use crate::helpers::{CRC32, get_hlc_from_valid_pathbuf, read_u8, read_u64};
-use crate::helpers::{
-    NUM_HASHES, check_crc, get_hashed_key_positions, read_exact_or_truncated, read_range,
-};
+use crate::helpers::get_hlc_from_valid_pathbuf;
+
 use crate::hlc::Hlc;
 use crate::lsm::Lookup::{Absent, Deleted, Found};
-use crate::lsm::SyncConfig::{Always, Every};
+use crate::lsm::SyncConfig::Every;
 use crate::manifest::{Manifest, ManifestEdit};
 use crate::memtable::AVL;
 use crate::sstable::SSTable;
 use crate::wal::{WAL, WalRecordType, WalRecoveryMode, WalReplayState};
-
-use std::cmp::{Ordering as CmpOrdering, Reverse, max};
 
 // WAL config for flush
 
@@ -278,7 +260,7 @@ impl KVEngine {
 
         wals_to_replay.sort_by_key(|(id, _)| *id);
 
-        let recovered = self_instance.retrieve__wal_records(&wals_to_replay)?;
+        let recovered = self_instance.retrieve_wal_records(&wals_to_replay)?;
         sstables[0].extend(recovered);
 
         // TODO MAYBE: Other than L0, all the other levels have no overlapping keys in the sstables
@@ -291,12 +273,10 @@ impl KVEngine {
         self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
         Ok(self_instance)
     }
-    fn retrieve__wal_records(&mut self, wals: &[(u64, PathBuf)]) -> Result<Vec<SSTable>> {
+    fn retrieve_wal_records(&mut self, wals: &[(u64, PathBuf)]) -> Result<Vec<SSTable>> {
         let mut recovered = Vec::new();
         for (index, (id, path)) in wals.iter().enumerate() {
-            let replay = self
-                .flushing_manager
-                .build_avl_from_wal(path, self.options.memtable_threshold)?;
+            let replay = WAL::build_avl_from_wal(path, self.options.memtable_threshold)?;
 
             let should_stop_replaying = match (replay.replay_state, self.options.wal_recovery_mode)
             {
@@ -342,142 +322,13 @@ impl KVEngine {
         Ok(recovered)
     }
 
-    fn should_search_sstable_file(key: &[u8], sstable: &SSTable) -> bool {
-        if let Some((min, max)) = &sstable.min_max_keys
-            && (key > max.as_slice() || key < min.as_slice())
-        {
-            return false;
-        }
-
-        if let Some(bloom_filter) = &sstable.bloom_filter {
-            let bf_bit_positions = get_hashed_key_positions(key, bloom_filter.num_bits as usize);
-            bloom_filter.check_bits(bf_bit_positions)
-        } else {
-            true // If we do not have a bloom filter, we just search the file without bloom filter optimization
-        }
-    }
-
-    fn search_kv_in_sstable(sstable: &SSTable, key: &[u8]) -> Result<Lookup> {
-        let Some((offset, data_len)) = sstable.binary_search_sparse_index(key) else {
-            return Ok(Absent);
-        };
-
-        if data_len > DATA_BLOCK_MAX_BYTES_SIZE {
-            return Err(DbError::DataCorrupted(DataCorruptedErr {
-                offset,
-                file_path: sstable.file_path.clone(),
-                reason: CorruptionType::BufferExceedsMaxLength {
-                    size: data_len,
-                    max_size: DATA_BLOCK_MAX_BYTES_SIZE,
-                },
-            }));
-        }
-        let mut data_buffer = vec![0u8; data_len as usize];
-
-        let mut crc = [0u8; CRC_LEN];
-
-        let mut reader = BufReader::new(&sstable.file);
-
-        reader.seek(SeekFrom::Start(offset))?;
-
-        reader.read_exact(&mut data_buffer)?;
-
-        //
-        // we read CRC here because data_len above doesnt take into account the 4 bytes for crc
-        reader.read_exact(&mut crc)?;
-        let crc_from_buff = u32::from_le_bytes(crc);
-
-        let fresh_crc = CRC32.compute_crc_data_block(&data_buffer);
-
-        check_crc(
-            fresh_crc,
-            crc_from_buff,
-            offset,
-            &sstable.file_path,
-            CrcType::DataBlock,
-        )?;
-
-        let mut pos = 0;
-        while pos < data_buffer.len() {
-            if pos + RECORD_HEADER_LEN > data_buffer.len() {
-                return Err(DbError::DataCorrupted(DataCorruptedErr {
-                    offset: offset + pos as u64,
-                    file_path: sstable.file_path.clone(),
-                    reason: CorruptionType::Other(format!(
-                        "truncated record header at buffer position {} (buffer len {})",
-                        pos,
-                        data_buffer.len(),
-                    )),
-                }));
-            }
-
-            // its actually: [ tstamp(8) | ksz(8) | value_sz(8) |tombstone| key | value |  ]
-            let ksz = read_u64(&data_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
-
-            let vsz = read_u64(&data_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
-
-            let deleted = read_range(
-                &data_buffer,
-                pos + RECORD_TOMBSTONE_OFFSET,
-                pos + RECORD_HEADER_LEN,
-            )?[0];
-            // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
-            // check ksz and vsz doesnt overflow
-            let key_start = pos + RECORD_HEADER_LEN;
-
-            let val_end = key_start
-                .checked_add(ksz)
-                .and_then(|v| v.checked_add(vsz))
-                .ok_or_else(|| {
-                    DbError::DataCorrupted(DataCorruptedErr {
-                        offset: offset + pos as u64,
-                        file_path: sstable.file_path.clone(),
-                        reason: CorruptionType::Other(format!(
-                            "record size overflow: ksz={ksz}, vsz={vsz}"
-                        )),
-                    })
-                })?;
-
-            if val_end > data_buffer.len() {
-                return Err(DbError::DataCorrupted(DataCorruptedErr {
-                    offset: offset + pos as u64,
-                    file_path: sstable.file_path.clone(),
-                    reason: CorruptionType::LengthMismatch {
-                        expected: val_end,
-                        found: data_buffer.len(),
-                    },
-                }));
-            }
-
-            let val_start = key_start + ksz; // if val_end is safe then this is safe(no overflow)
-            let curr_key = read_range(&data_buffer, key_start, val_start)?;
-            // let curr_key = &data_buffer[key_start..val_start];
-            let value = read_range(&data_buffer, val_start, val_end)?;
-            // let value: &[u8] = &data_buffer[val_start..val_end];
-
-            match curr_key.cmp(key) {
-                CmpOrdering::Less => {
-                    pos = val_end;
-                    continue;
-                }
-                CmpOrdering::Equal => {
-                    if deleted == TOMBSTONE_DELETED {
-                        return Ok(Deleted);
-                    }
-                    return Ok(Found(value.to_vec()));
-                }
-                CmpOrdering::Greater => break,
-            }
-        }
-        Ok(Absent)
-    }
     fn search_for_kv_in_sstables(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(sstables) = &self.sstables {
             // Lock here is held for the entirety of the loop. Ok for now, mostly reads, rare writes
             for level in sstables.read().unwrap().iter() {
                 for element in level.iter() {
-                    match Self::should_search_sstable_file(key, element) {
-                        true => match Self::search_kv_in_sstable(element, key)? {
+                    match element.should_search_sstable_file(key) {
+                        true => match element.search_kv_in_sstable(key)? {
                             Found(k) => return Ok(Some(k)),
                             Deleted => return Ok(None),
                             Absent => {
@@ -509,7 +360,7 @@ impl KVEngine {
             Absent => {} // fall through
         }
 
-        for (id, mem_table_instance) in self.frozen_memtables.iter().rev() {
+        for (_, mem_table_instance) in self.frozen_memtables.iter().rev() {
             // rev() because we search newer memtables first which have a higher id(hlc)
 
             match mem_table_instance.memtable.get(key) {
