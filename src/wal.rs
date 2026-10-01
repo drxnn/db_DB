@@ -353,7 +353,7 @@ mod tests {
                 Some(v) => Found(v.to_vec()),
                 None => Deleted,
             };
-            assert_eq!(replay.memtable.get(k), expected,);
+            assert_eq!(replay.memtable.get(k), expected);
         }
 
         assert_eq!(replay.records_recovered, WAL_RECORDS.len() as u64);

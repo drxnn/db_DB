@@ -291,12 +291,11 @@ impl SSTable {
             }
 
             // its actually: [ tstamp(8) | ksz(8) | value_sz(8) |tombstone| key | value |  ]
-            let ksz = read_u64(&data_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
-
-            let vsz = read_u64(&data_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
+            let ksz = read_u64(data_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
+            let vsz = read_u64(data_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
 
             let deleted = read_range(
-                &data_buffer,
+                data_buffer,
                 pos + RECORD_TOMBSTONE_OFFSET,
                 pos + RECORD_HEADER_LEN,
             )?[0];

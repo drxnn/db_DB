@@ -681,7 +681,125 @@ impl PartialEq for MergeItem {
 }
 impl Eq for MergeItem {}
 
+#[cfg(test)]
+mod tests {
+    use std::assert_eq;
+
+    use crate::{constants::MAX_MEMTABLE_THRESHOLD, memtable::AVL, sstable::SSTable};
+
+    use super::*;
+    use crate::lsm::Lookup;
+    use tempfile::{TempDir, tempdir};
+
+    const SSTS: &[&[(&[u8], Option<&[u8]>)]] = &[
+        // sst 1 (oldest): the base data
+        &[
+            (b"apple", Some(b"red")),
+            (b"banana", Some(b"yellow")),
+            (b"cherry", Some(b"dark red")),
+            (b"grape", Some(b"purple")),
+            (b"kiwi", Some(b"green")),
+            (b"mango", Some(b"orange")),
+        ],
+        &[
+            (b"apple", Some(b"green")),
+            (b"banana", None),
+            (b"date", Some(b"brown")),
+            (b"kiwi", None),
+            (b"a", Some(b"prefix of apple")),
+            (b"app", Some(b"also a prefix")),
+        ],
+        &[
+            (b"kiwi", Some(b"gold")),
+            (b"cherry", Some(b"")),
+            (b"fig", None),
+            (b"mango", Some(b"ripe")),
+            (b"\x00low", Some(b"binary key")),
+        ],
+        &[
+            // no overlap here with the other ssts
+            (b"x-ray", Some(b"1")),
+            (b"yak", Some(b"2")),
+            (b"zebra", Some(b"3")),
+            (b"\xffhigh", Some(b"binary key")),
+        ],
+    ];
+    const EXPECTED: &[(&[u8], Option<&[u8]>)] = &[
+        (b"\x00low", Some(b"binary key")),
+        (b"a", Some(b"prefix of apple")),
+        (b"app", Some(b"also a prefix")),
+        (b"apple", Some(b"green")),
+        (b"banana", None),
+        (b"cherry", Some(b"")),
+        (b"date", Some(b"brown")),
+        (b"fig", None),
+        (b"grape", Some(b"purple")),
+        (b"kiwi", Some(b"gold")),
+        (b"mango", Some(b"ripe")),
+        (b"x-ray", Some(b"1")),
+        (b"yak", Some(b"2")),
+        (b"zebra", Some(b"3")),
+        (b"\xffhigh", Some(b"binary key")),
+    ];
+
+    #[test]
+    fn compacts_ssts_and_gives_correct_final_sst() {
+        let hlc: Hlc = Hlc::new();
+        let dir = tempdir().unwrap();
+        let mut ssts: Vec<SSTable> = Vec::new();
+        let mut sst_slices: Vec<CompactionSstSlice> = Vec::new();
+        for (i, sst) in SSTS.iter().enumerate() {
+            let mut memtable = AVL::new(MAX_MEMTABLE_THRESHOLD);
+            for (i, (k, v)) in sst.iter().enumerate() {
+                match v {
+                    None => memtable.delete(k, hlc.tick()),
+                    &Some(v) => {
+                        memtable.put(k, v, hlc.tick());
+                    }
+                }
+            }
+
+            let (f, sst_path) = memtable.sync_avl(dir.path(), hlc.tick()).unwrap().unwrap();
+            let sst = SSTable::load(&sst_path).unwrap();
+            sst_slices.push(CompactionSstSlice {
+                file_path: sst.file_path.clone(),
+                id: sst.id,
+                level: sst.level,
+                sparse_index: Arc::clone(&sst.sparse_index),
+                sparse_index_curr_position: 0,
+            });
+            ssts.push(sst);
+        }
+        let compaction_job =
+            CompactionJob::new(sst_slices, 1, dir.path().to_path_buf(), Arc::new(hlc));
+        let mut manager = CompactionManager::new();
+        manager.start(compaction_job);
+
+        let outcome = manager.wait_for_handle_finish().unwrap().unwrap();
+        let file_id_of_final_sst = outcome.final_sst_files.first().unwrap();
+        let path_of_final_sst = dir.path().join(format!("{file_id_of_final_sst}.sst"));
+        let mut final_sstable = SSTable::load(&path_of_final_sst).unwrap();
+
+        for (k, v) in EXPECTED {
+            match v {
+                None => assert_eq!(
+                    final_sstable.search_kv_in_sstable(k).unwrap(),
+                    Lookup::Deleted
+                ),
+                &Some(v) => {
+                    assert_eq!(
+                        final_sstable.search_kv_in_sstable(k).unwrap(),
+                        Lookup::Found(v.to_vec())
+                    )
+                }
+            }
+        }
+    }
+}
 /*
+
+
+
 TODOs:
 TODO: if we are compacting and the output is the last level, deletes can be dropped completely
 NOT DONE YET: Handle all errors
