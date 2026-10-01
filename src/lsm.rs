@@ -378,6 +378,8 @@ impl KVEngine {
         if let Some(err_msg) = &self.db_failed {
             return Err(DbError::ReadOnly(err_msg.to_string()));
         }
+
+        self.maintenance()?;
         self.memtable
             .exceeds_max(key.len() as u64, value.len() as u64)?;
 
@@ -416,6 +418,7 @@ impl KVEngine {
         if let Some(err_str) = &self.db_failed {
             return Err(DbError::ReadOnly(err_str.to_string()));
         }
+        self.maintenance()?;
         let k_len = key.len() as u64;
         self.memtable.exceeds_max(k_len, 0)?;
         if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold {

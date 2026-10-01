@@ -8,7 +8,9 @@ use crate::constants::{
     VALUE_MAX_BYTES_SIZE,
 };
 use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError, Result};
-use crate::helpers::{CRC32, check_crc, read_exact_or_truncated};
+use crate::helpers::{
+    CRC32, check_crc, check_key_value_record_does_not_exceed_max, read_exact_or_truncated,
+};
 use crate::lsm::SyncConfig::{self, Always, Every};
 
 use crate::memtable::AVL;
@@ -155,15 +157,12 @@ impl WAL {
 
                         let key_size = u64::from_le_bytes(ksz);
 
-                        if key_size > KEY_MAX_BYTES_SIZE {
-                            return Err(DbError::DataCorrupted(DataCorruptedErr {
-                                offset: pos,
-                                file_path: path.to_path_buf(),
-                                reason: CorruptionType::Other(format!(
-                                    "record size overflow: ksz={key_size}"
-                                )),
-                            }));
-                        }
+                        check_key_value_record_does_not_exceed_max(
+                            key_size,
+                            KEY_MAX_BYTES_SIZE,
+                            pos,
+                            path,
+                        )?;
                         let mut key_buffer = vec![0u8; key_size as usize];
 
                         read_exact_or_truncated(&mut reader, &mut key_buffer, curr_offset, path)?;
@@ -197,15 +196,18 @@ impl WAL {
                         let key_size = u64::from_le_bytes(ksz);
                         let val_size = u64::from_le_bytes(vsz);
 
-                        if key_size > KEY_MAX_BYTES_SIZE || val_size > VALUE_MAX_BYTES_SIZE {
-                            return Err(DbError::DataCorrupted(DataCorruptedErr {
-                                offset: pos,
-                                file_path: path.to_path_buf(),
-                                reason: CorruptionType::Other(format!(
-                                    "record size overflow: ksz={key_size} vsz={val_size}"
-                                )),
-                            }));
-                        }
+                        check_key_value_record_does_not_exceed_max(
+                            key_size,
+                            KEY_MAX_BYTES_SIZE,
+                            pos,
+                            path,
+                        )?;
+                        check_key_value_record_does_not_exceed_max(
+                            val_size,
+                            VALUE_MAX_BYTES_SIZE,
+                            pos,
+                            path,
+                        )?;
                         let mut key_buffer = vec![0u8; key_size as usize];
                         let mut val_buffer = vec![0u8; val_size as usize];
 
@@ -309,7 +311,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     const WAL_ID: u64 = 1;
 
-    const BIG_VALUE: [u8; 20_000] = [b'x'; 20_000];
+    static BIG_VALUE: [u8; 20_000] = [b'x'; 20_000];
 
     const WAL_RECORDS: &[(&[u8], Option<&[u8]>)] = &[
         (b"user:1", Some(b"alice")),
@@ -320,7 +322,7 @@ mod tests {
         (b"empty", Some(b"")),
         (b"bin\x00key", Some(b"\x00\x02\x04\xff")), // tag bytes
         (b"big", Some(&BIG_VALUE)),
-        (b"user:4", Some(b"dave")), // a record after the big one
+        (b"user:4", Some(b"dave")),
     ];
     fn create_wal() -> (TempDir, WAL) {
         let dir = tempdir().unwrap();
@@ -339,7 +341,7 @@ mod tests {
                 Some(v) => WalRecordType::Insertion(key, v),
                 None => WalRecordType::Deletion(key),
             };
-            latest_records.insert(key, *value); // for the test below
+            latest_records.insert(key, *value);
             wal.record_to_wal(record, ts as u64).unwrap();
         }
 
@@ -381,5 +383,71 @@ mod tests {
             }))
         ));
         assert_eq!(replay.records_recovered, 0); // corrupted the first record
+    }
+
+    #[test]
+    fn wal_with_corrupted_record_returns_replay_up_to_that_point() {
+        let (_dir, mut wal) = create_wal();
+        let corrupt_record_index = 5;
+        let mut corrupt_record_start = 0;
+        for (ts, (key, value)) in WAL_RECORDS.iter().enumerate() {
+            if ts == corrupt_record_index {
+                corrupt_record_start = fs::metadata(&wal.path).unwrap().len();
+            }
+            let record = match value {
+                Some(v) => WalRecordType::Insertion(key, v),
+                None => WalRecordType::Deletion(key),
+            };
+            wal.record_to_wal(record, ts as u64).unwrap();
+        }
+
+        flip_bit_at(
+            &wal.path,
+            (corrupt_record_start + TAG_LEN as u64 + U64_LEN as u64),
+        );
+        let replay = WAL::build_avl_from_wal(&wal.path, MAX_MEMTABLE_THRESHOLD).unwrap();
+
+        assert!(matches!(
+            replay.replay_state,
+            WalReplayState::PartialError(_)
+        ));
+        assert!(replay.records_recovered == corrupt_record_index as u64);
+        assert_eq!(
+            replay.most_recent_hlc,
+            Some(corrupt_record_index as u64 - 1)
+        );
+    }
+
+    #[test]
+    fn absurd_length_field_is_rejected() {
+        for tag in [TAG_INSERTION, TAG_DELETION] {
+            let (_dir, wal) = create_wal();
+
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            fs::write(&wal.path, &bytes).unwrap();
+
+            let replay = WAL::build_avl_from_wal(&wal.path, MAX_MEMTABLE_THRESHOLD).unwrap();
+            assert!(matches!(
+                replay.replay_state,
+                WalReplayState::PartialError(DbError::DataCorrupted(DataCorruptedErr {
+                    reason: CorruptionType::KeyValueRecordExceedsMaxLength {
+                        max: KEY_MAX_BYTES_SIZE,
+                        found: u64::MAX,
+                    },
+                    offset: 0,
+                    ..
+                }))
+            ));
+            assert_eq!(replay.records_recovered, 0);
+        }
+    }
+    #[test]
+    fn new_refuses_to_overwrite_existing_wal() {
+        let (dir, _wal) = create_wal();
+        let again = WAL::new(MAX_MEMTABLE_THRESHOLD, SyncConfig::None, dir.path(), WAL_ID);
+        assert!(again.is_err());
     }
 }

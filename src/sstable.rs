@@ -256,22 +256,17 @@ impl SSTable {
                 },
             }));
         }
-        let mut data_buffer = vec![0u8; data_len as usize];
 
-        let mut crc = [0u8; CRC_LEN];
-
-        let mut reader = BufReader::new(&self.file);
-
-        reader.seek(SeekFrom::Start(offset))?;
-
-        reader.read_exact(&mut data_buffer)?;
+        let mut data_block_buffer_and_crc = vec![0u8; data_len as usize + CRC_LEN];
+        self.file
+            .read_exact_at(&mut data_block_buffer_and_crc, offset)?;
+        let (data_buffer, crc) = data_block_buffer_and_crc.split_at(data_len as usize);
+        let crc_from_buff = u32::from_le_bytes(crc.try_into().unwrap());
 
         //
         // we read CRC here because data_len above doesnt take into account the 4 bytes for crc
-        reader.read_exact(&mut crc)?;
-        let crc_from_buff = u32::from_le_bytes(crc);
 
-        let fresh_crc = CRC32.compute_crc_data_block(&data_buffer);
+        let fresh_crc = CRC32.compute_crc_data_block(data_buffer);
 
         check_crc(
             fresh_crc,

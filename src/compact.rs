@@ -683,14 +683,14 @@ impl Eq for MergeItem {}
 
 /*
 TODOs:
+TODO: if we are compacting and the output is the last level, deletes can be dropped completely
 NOT DONE YET: Handle all errors
 NOT DONE YET: Perform compaction using multiple threads, split work into subCompactionJob where each thread works on specific slices of the input files
 NOT DONE YET: need pickFilesForCompaction function(before we do this, we should separate directories into L0, L1, L2, L3 etc)
 NOT DONE YET: needs pickSubSlicesOfFilesForCompaction // picks ranges(of each file) for each thread to work on.
-NOT DONE YET Ensure output files have no overlapping keys, this is easy since thread will work from min range of file1 to max range of file k
-NOT DONE YET: Fix all unwraps in lsm.rs
-NOT DONE YET: Modularize the code
-NOT DONE YET: Extract some duplicate functionality into their own functions
+qNOT DONE YET Ensure output files have no overlapping keys, this is easy since thread will work from min range of file1 to max range of file
+(somehwat done): Modularize the code
+(somewhat done)Extract some duplicate functionality into their own functions
 NOT DONE YET(Important): If we are at the bottom level of ssts, deleted records do not have to be pushed to the final merged_file, instead they are really deleted.
 NOT DONE YET: Compress bytes. check lz4 library for that
 
