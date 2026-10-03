@@ -1,4 +1,3 @@
-pub const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
 pub const MEMTABLE_THRESHOLD: u64 = 8 * 1024 * 1024; // SUBJECT TO CHANGE
 // this means L0 sstables are 8 mb, so we usually compact all L0 sstablse with all L1 sstables to a single L1 sstable.
 pub const DATA_BLOCK: usize = 8 * 1024; // Data block in SSTable
@@ -19,11 +18,6 @@ pub const MASK_FOR_COUNTER: u64 = (u64::MAX) >> NUM_OF_BITS_FOR_TSTAMP;
 pub const MASK_FOR_TSTAMP: u64 = (u64::MAX) << NUM_OF_BITS_FOR_COUNTER;
 pub const LEVEL_MULTIPLIER: usize = 10; // 
 
-pub const NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION: usize = 10;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L1_COMPACTION: u64 = MAX_SST_SIZE * 10;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L2_COMPACTION: u64 = MAX_SST_SIZE * 100;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L3_COMPACTION: u64 = MAX_SST_SIZE * 1000;
-pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L4_COMPACTION: u64 = MAX_SST_SIZE * 10000;
 pub const DEFAULT_DATA_DIR: &str = "data";
 pub const MAX_FLUSH_ATTEMPTS: u8 = 5;
 
@@ -78,3 +72,8 @@ pub const MANIFEST_TMP_FILE_NAME: &str = "MANIFEST.tmp";
 
 pub const MAX_FROZEN_MEMTABLES_LIMIT: u8 = 24;
 pub const MAX_MEMTABLE_THRESHOLD: u64 = 256 * 1024 * 1024;
+
+pub const MIN_L0_COMPACTION_TRIGGER: usize = 2;
+pub const MAX_L0_COMPACTION_TRIGGER: usize = 50;
+pub const MIN_LEVEL_MULTIPLIER: u64 = 2;
+pub const MAX_LEVEL_MULTIPLIER: u64 = 20;

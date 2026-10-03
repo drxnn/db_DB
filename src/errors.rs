@@ -71,9 +71,39 @@ pub enum CorruptionType {
 
 #[derive(Debug)]
 pub enum InvalidOptions {
-    MemtableThresholdOutOfRange { min: u64, max: u64, found: u64 },
-    MaxFrozenMemtablesOutOfRange { min: u8, max: u8, found: u8 },
+    MemtableThresholdOutOfRange {
+        min: u64,
+        max: u64,
+        found: u64,
+    },
+    MaxFrozenMemtablesOutOfRange {
+        min: u8,
+        max: u8,
+        found: u8,
+    },
     SyncIntervalIsZero,
+    MaxSstSizeTooSmall {
+        min: u64,
+        found: u64,
+    },
+    MaxFlushRetriesTooLarge {
+        max: u8,
+        found: u8,
+    },
+    L0CompactionTriggerOutOfRange {
+        min: usize,
+        max: usize,
+        found: usize,
+    },
+    LevelMultiplierOutOfRange {
+        min: u64,
+        max: u64,
+        found: u64,
+    },
+    MaxBytesForLevelSmallerThanSstSize {
+        max_bytes_for_level_base: u64,
+        max_sst_size: u64,
+    },
 }
 
 impl From<InvalidOptions> for DbError {
@@ -359,6 +389,33 @@ impl fmt::Display for DbError {
                     "Invalid options: memtable_threshold must be between {min} and {max} bytes \
          (the minimum must fit one max size record). Found: {found}"
                 ),
+                InvalidOptions::MaxSstSizeTooSmall { min, found } => write!(
+                    f,
+                    "Invalid options: max_sst_size must be at least {min} bytes \
+         (one full data block, including a max size record). Found: {found}"
+                ),
+                InvalidOptions::L0CompactionTriggerOutOfRange { min, max, found } => write!(
+                    f,
+                    "Invalid options: l0_compaction_trigger must be between {min} and {max} files. Found: {found}"
+                ),
+                InvalidOptions::LevelMultiplierOutOfRange { min, max, found } => write!(
+                    f,
+                    "Invalid options: level_multiplier must be between {min} and {max}. Found: {found}"
+                ),
+                InvalidOptions::MaxBytesForLevelSmallerThanSstSize {
+                    max_bytes_for_level_base,
+                    max_sst_size,
+                } => write!(
+                    f,
+                    "Invalid options: max_bytes_for_level_base ({max_bytes_for_level_base}) must be at least \
+         max_sst_size ({max_sst_size}), so L1 can hold at least one file"
+                ),
+                InvalidOptions::MaxFlushRetriesTooLarge { max, found } => {
+                    write!(
+                        f,
+                        "Invalid options: Limit for max_flush_retries is {max}. Found: {found}"
+                    )
+                }
             },
             Self::WritesStalled { frozen_memtables } => {
                 write!(

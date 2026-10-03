@@ -8,9 +8,10 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
 use crate::constants::{
-    KEY_MAX_BYTES_SIZE, MAX_FLUSH_ATTEMPTS, MAX_FROZEN_MEMTABLES_LIMIT, MAX_MEMTABLE_THRESHOLD,
-    MAX_SST_SIZE, NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION, RECORD_HEADER_LEN, SST_EXT,
-    SST_LEVEL_COUNT, TMP_EXT, VALUE_MAX_BYTES_SIZE, WAL_EXT,
+    DATA_BLOCK_MAX_BYTES_SIZE, KEY_MAX_BYTES_SIZE, MAX_FLUSH_ATTEMPTS, MAX_FROZEN_MEMTABLES_LIMIT,
+    MAX_L0_COMPACTION_TRIGGER, MAX_LEVEL_MULTIPLIER, MAX_MEMTABLE_THRESHOLD,
+    MIN_L0_COMPACTION_TRIGGER, MIN_LEVEL_MULTIPLIER, RECORD_HEADER_LEN, SST_EXT, SST_LEVEL_COUNT,
+    TMP_EXT, VALUE_MAX_BYTES_SIZE, WAL_EXT,
 };
 
 use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidOptions, Result};
@@ -47,6 +48,10 @@ pub struct KVEngineOptions {
     memtable_threshold: u64,
     max_flush_retries: u8,
     max_frozen_memtables: u8, // whem max is reached, pause writes until we finish at least 1
+    max_sst_size: u64,        // default 100MB
+    l0_compaction_trigger: usize, //default 10, cap it between 2-50
+    max_bytes_for_level_base: u64,
+    level_multiplier: u64, // needs to be more than 2
 }
 impl Default for KVEngineOptions {
     fn default() -> Self {
@@ -56,6 +61,10 @@ impl Default for KVEngineOptions {
             memtable_threshold: 8 * 1024 * 1024,
             max_flush_retries: 5,
             max_frozen_memtables: 4,
+            max_sst_size: 100 * 1024 * 1024,
+            l0_compaction_trigger: 10,
+            max_bytes_for_level_base: 10 * 100 * 1024 * 1024, // base for L1
+            level_multiplier: 10,
         }
     }
 }
@@ -79,11 +88,51 @@ impl KVEngineOptions {
             }
             .into());
         }
+        if self.max_flush_retries > MAX_FLUSH_ATTEMPTS {
+            return Err(InvalidOptions::MaxFlushRetriesTooLarge {
+                max: MAX_FLUSH_ATTEMPTS,
+                found: self.max_flush_retries,
+            }
+            .into());
+        }
 
         if let Every(ms) = self.sync
             && ms == 0
         {
             return Err(InvalidOptions::SyncIntervalIsZero.into());
+        }
+        if self.max_sst_size < DATA_BLOCK_MAX_BYTES_SIZE {
+            return Err(InvalidOptions::MaxSstSizeTooSmall {
+                min: DATA_BLOCK_MAX_BYTES_SIZE,
+                found: self.max_sst_size,
+            }
+            .into());
+        }
+
+        if !(MIN_L0_COMPACTION_TRIGGER..=MAX_L0_COMPACTION_TRIGGER)
+            .contains(&self.l0_compaction_trigger)
+        {
+            return Err(InvalidOptions::L0CompactionTriggerOutOfRange {
+                min: MIN_L0_COMPACTION_TRIGGER,
+                max: MAX_L0_COMPACTION_TRIGGER,
+                found: self.l0_compaction_trigger,
+            }
+            .into());
+        }
+        if !(MIN_LEVEL_MULTIPLIER..=MAX_LEVEL_MULTIPLIER).contains(&self.level_multiplier) {
+            return Err(InvalidOptions::LevelMultiplierOutOfRange {
+                min: MIN_LEVEL_MULTIPLIER,
+                max: MAX_LEVEL_MULTIPLIER,
+                found: self.level_multiplier,
+            }
+            .into());
+        }
+        if self.max_bytes_for_level_base < self.max_sst_size {
+            return Err(InvalidOptions::MaxBytesForLevelSmallerThanSstSize {
+                max_bytes_for_level_base: self.max_bytes_for_level_base,
+                max_sst_size: self.max_sst_size,
+            }
+            .into());
         }
 
         Ok(())
@@ -574,7 +623,7 @@ impl KVEngine {
         let mut best_ratio_candidate: Option<(f64, u8)> = None; // first number is ratio, second is what level
 
         let l0 = &levels[0];
-        let ratio = l0.len() as f64 / NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION as f64;
+        let ratio = l0.len() as f64 / self.options.l0_compaction_trigger as f64;
         if ratio >= 1_f64 {
             best_ratio_candidate = Some((ratio, 0))
         }
@@ -585,7 +634,11 @@ impl KVEngine {
             let bytes_in_entire_level: u64 =
                 sstables_in_level.iter().map(|sst| sst.file_size).sum();
 
-            let target_to_trigger: u64 = MAX_SST_SIZE * 10_u64.pow(level as u32); // corresponds to NUM_OF_BYTES_NEEDED_TO_TRIGGER_L1_COMPACTION et al
+            let target_to_trigger = self
+                .options
+                .level_multiplier
+                .saturating_pow(level as u32 - 1)
+                .saturating_mul(self.options.max_bytes_for_level_base); // we use L1s cap to compute it
 
             if bytes_in_entire_level < target_to_trigger {
                 continue;
@@ -710,6 +763,7 @@ impl KVEngine {
                 level + 1,
                 self.data_directory.clone(),
                 Arc::clone(&self.hlc),
+                self.options.max_sst_size,
             );
 
             // if this returns an error, because one or more of the files are corrupt, trying again will just error again
@@ -752,7 +806,8 @@ impl KVEngine {
                             self.data_directory.clone(),
                         )?;
                     } else {
-                        self.fail(format!("memtable {id} failed to flush after {MAX_FLUSH_ATTEMPTS} attempts. \
+                        let max_flush_retries = self.options.max_flush_retries;
+                        self.fail(format!("memtable {id} failed to flush after {max_flush_retries} attempts. \
                                             No later memtable can retire behind it, so memory will keep growing. \
                                             Its data is still in its WAL and will be recovered on reopen: {error}"));
                         return Err(error);

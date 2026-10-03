@@ -20,7 +20,7 @@ use crate::errors::CompactionErr::{self};
 
 use crate::constants::{
     BLOOM_BITS_PER_KEY, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
-    MAX_SST_SIZE, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
+    TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
 };
 use crate::errors::CrcType;
 use crate::helpers::{
@@ -55,10 +55,17 @@ struct SstFinalizer {
     offset: u64,
     min_key: Vec<u8>, // max_key can be obtained by doing data_block.grab_max_key() at the end
     bytes_written_to_file: u64,
+    max_sst_size: u64,
 }
 
 impl SstFinalizer {
-    fn new(dir: &Path, starting_key: Vec<u8>, hlc: &Hlc, lvl: u8) -> Result<Self> {
+    fn new(
+        dir: &Path,
+        starting_key: Vec<u8>,
+        hlc: &Hlc,
+        lvl: u8,
+        max_sst_size: u64,
+    ) -> Result<Self> {
         //
         let id: u64 = hlc.tick();
         let (file, final_file) = create_new_data_file(dir, id)?;
@@ -74,11 +81,12 @@ impl SstFinalizer {
             offset: 0,
             bytes_written_to_file: 0,
             level: lvl,
+            max_sst_size,
         })
     }
 
     fn would_exceed_max_sst_size(&self, record_len: u64) -> bool {
-        self.bytes_written_to_file + record_len > MAX_SST_SIZE
+        self.bytes_written_to_file + record_len > self.max_sst_size
     }
 }
 
@@ -407,6 +415,7 @@ pub struct CompactionJob {
     data_dir: PathBuf,
     hlc: Arc<Hlc>,
     level_for_output_sst: u8,
+    max_sst_size: u64,
 }
 
 #[derive(Default)]
@@ -432,12 +441,14 @@ impl CompactionJob {
         level_for_output_sst: u8,
         data_dir: PathBuf,
         hlc: Arc<Hlc>,
+        max_sst_size: u64,
     ) -> Self {
         Self {
             files,
             data_dir,
             hlc,
             level_for_output_sst,
+            max_sst_size,
         }
     }
 
@@ -447,6 +458,7 @@ impl CompactionJob {
             data_dir,
             hlc,
             level_for_output_sst,
+            max_sst_size,
         } = self;
         let data_dir_for_err_case = data_dir.clone();
         let mut cmpt_outcome = CompactionOutcome::new(level_for_output_sst);
@@ -473,7 +485,14 @@ impl CompactionJob {
 
                 cfe_vec.push(cfe);
             }
-            CompactionJob::merge_to_final(&mut cmpt_outcome, heap, &mut cfe_vec, data_dir, hlc)
+            CompactionJob::merge_to_final(
+                &mut cmpt_outcome,
+                heap,
+                &mut cfe_vec,
+                data_dir,
+                hlc,
+                max_sst_size,
+            )
         })();
 
         match result {
@@ -561,6 +580,7 @@ impl CompactionJob {
         cfe_vec: &mut [CompactionFileElement],
         data_dir: PathBuf,
         hlc: Arc<Hlc>,
+        max_sst_size: u64,
     ) -> Result<()> {
         // grab min key before we start
         let Some(first) = heap.peek() else {
@@ -573,6 +593,7 @@ impl CompactionJob {
             min_k,
             &hlc,
             compaction_outcome.level_for_output_sst,
+            max_sst_size,
         )?;
 
         compaction_outcome.final_sst_files.push(sst_finalizer.id);
@@ -589,7 +610,8 @@ impl CompactionJob {
                         curr_merge_item.0.entry.key.clone(),
                         &hlc,
                         compaction_outcome.level_for_output_sst,
-                    )?; // after 160MB, one sst is done // 
+                        max_sst_size,
+                    )?;
                     compaction_outcome.final_sst_files.push(sst_finalizer.id);
                 }
 
@@ -683,13 +705,17 @@ impl Eq for MergeItem {}
 
 #[cfg(test)]
 mod tests {
-    use std::assert_eq;
+    use std::{assert_eq, sync::LazyLock};
 
-    use crate::{constants::MAX_MEMTABLE_THRESHOLD, memtable::AVL, sstable::SSTable};
+    use crate::{
+        constants::MAX_MEMTABLE_THRESHOLD, memtable::AVL, sstable::SSTable, test_utils::flip_bit_at,
+    };
 
     use super::*;
+    use crate::errors::CorruptionType;
     use crate::lsm::Lookup;
     use tempfile::{TempDir, tempdir};
+    static HLC: LazyLock<Arc<Hlc>> = LazyLock::new(|| Arc::new(Hlc::new()));
 
     const SSTS: &[&[(&[u8], Option<&[u8]>)]] = &[
         // sst 1 (oldest): the base data
@@ -742,24 +768,42 @@ mod tests {
         (b"\xffhigh", Some(b"binary key")),
     ];
 
-    #[test]
-    fn compacts_ssts_and_gives_correct_final_sst() {
-        let hlc: Hlc = Hlc::new();
-        let dir = tempdir().unwrap();
-        let mut ssts: Vec<SSTable> = Vec::new();
+    fn generate_big_ssts() -> Vec<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        let write_key = |n: u64| format!("key{n:05}").into_bytes();
+        let write_value = |sst: u64, n: u64| Some(format!("sst{sst}-value{n:0100}").into_bytes());
+
+        let sst1 = (0..3000)
+            .map(|n| (write_key(n), write_value(1, n)))
+            .collect();
+        let sst2 = (0..4000)
+            .filter_map(|n| match n {
+                n if n >= 3000 => Some((write_key(n), write_value(2, n))),
+                n if n % 7 == 0 => Some((write_key(n), None)), // delete
+                n if n % 3 == 0 => Some((write_key(n), write_value(2, n))), // overwrite
+                _ => None,
+            })
+            .collect();
+        let sst3 = (0..4000)
+            .step_by(5) //overwrites
+            .map(|n| (write_key(n), write_value(3, n)))
+            .collect();
+        return vec![sst1, sst2, sst3]; // rust-analyzer 
+    }
+
+    fn sets_compaction_slices(path: &Path) -> Vec<CompactionSstSlice> {
         let mut sst_slices: Vec<CompactionSstSlice> = Vec::new();
         for (i, sst) in SSTS.iter().enumerate() {
             let mut memtable = AVL::new(MAX_MEMTABLE_THRESHOLD);
             for (i, (k, v)) in sst.iter().enumerate() {
                 match v {
-                    None => memtable.delete(k, hlc.tick()),
+                    None => memtable.delete(k, HLC.tick()),
                     &Some(v) => {
-                        memtable.put(k, v, hlc.tick());
+                        memtable.put(k, v, HLC.tick());
                     }
                 }
             }
 
-            let (f, sst_path) = memtable.sync_avl(dir.path(), hlc.tick()).unwrap().unwrap();
+            let (f, sst_path) = memtable.sync_avl(path, HLC.tick()).unwrap().unwrap();
             let sst = SSTable::load(&sst_path).unwrap();
             sst_slices.push(CompactionSstSlice {
                 file_path: sst.file_path.clone(),
@@ -768,17 +812,29 @@ mod tests {
                 sparse_index: Arc::clone(&sst.sparse_index),
                 sparse_index_curr_position: 0,
             });
-            ssts.push(sst);
         }
-        let compaction_job =
-            CompactionJob::new(sst_slices, 1, dir.path().to_path_buf(), Arc::new(hlc));
+        sst_slices
+    }
+
+    #[test]
+    fn compacts_ssts_and_gives_correct_final_sst() {
+        let dir = tempdir().unwrap();
+
+        let sst_slices = sets_compaction_slices(dir.path());
+        let compaction_job = CompactionJob::new(
+            sst_slices,
+            1,
+            dir.path().to_path_buf(),
+            Arc::clone(&HLC),
+            64 * 1024,
+        );
         let mut manager = CompactionManager::new();
-        manager.start(compaction_job);
+        manager.start(compaction_job).unwrap();
 
         let outcome = manager.wait_for_handle_finish().unwrap().unwrap();
         let file_id_of_final_sst = outcome.final_sst_files.first().unwrap();
         let path_of_final_sst = dir.path().join(format!("{file_id_of_final_sst}.sst"));
-        let mut final_sstable = SSTable::load(&path_of_final_sst).unwrap();
+        let final_sstable = SSTable::load(&path_of_final_sst).unwrap();
 
         for (k, v) in EXPECTED {
             match v {
@@ -794,6 +850,47 @@ mod tests {
                 }
             }
         }
+        assert!(outcome.final_sst_files.len() == 1);
+        assert!(outcome.consumed_sst_files.len() == 4);
+    }
+
+    #[test]
+    fn compaction_with_one_corrupted_sst_fails() {
+        let dir = tempdir().unwrap();
+        let ssts = sets_compaction_slices(dir.path());
+        let corrupted = &ssts[2];
+        let (_, block_offset, block_len) = &corrupted.sparse_index[0];
+        flip_bit_at(&corrupted.file_path, *block_offset + *block_len / 2);
+        let corrupted_path = corrupted.file_path.clone();
+        let compaction_job = CompactionJob::new(
+            ssts,
+            1,
+            dir.path().to_path_buf(),
+            Arc::clone(&HLC),
+            64 * 1024,
+        );
+        let mut manager = CompactionManager::new();
+        manager.start(compaction_job).unwrap();
+        let result = manager.wait_for_handle_finish().unwrap();
+
+        let err = match result {
+            Err(DbError::DataCorrupted(err)) => err,
+            _ => panic!("expected a DataCorrupted error"),
+        };
+
+        assert!(matches!(
+            err.reason,
+            CorruptionType::CrcMismatch {
+                mismatch_type: CrcType::DataBlock,
+                ..
+            }
+        ));
+        assert_eq!(err.file_path, corrupted_path);
+    }
+
+    #[test]
+    fn compacts() {
+        let ssts = generate_big_ssts();
     }
 }
 /*
