@@ -705,10 +705,13 @@ impl Eq for MergeItem {}
 
 #[cfg(test)]
 mod tests {
-    use std::{assert_eq, sync::LazyLock};
+    use std::{assert_eq, collections::BTreeMap, sync::LazyLock, todo};
 
     use crate::{
-        constants::MAX_MEMTABLE_THRESHOLD, memtable::AVL, sstable::SSTable, test_utils::flip_bit_at,
+        constants::{MAX_MEMTABLE_THRESHOLD, TEST_MAX_SST_SIZE},
+        memtable::AVL,
+        sstable::SSTable,
+        test_utils::flip_bit_at,
     };
 
     use super::*;
@@ -787,24 +790,49 @@ mod tests {
             .step_by(5) //overwrites
             .map(|n| (write_key(n), write_value(3, n)))
             .collect();
-        return vec![sst1, sst2, sst3]; // rust-analyzer 
+        return vec![sst1, sst2, sst3];
     }
 
-    fn sets_compaction_slices(path: &Path) -> Vec<CompactionSstSlice> {
-        let mut sst_slices: Vec<CompactionSstSlice> = Vec::new();
-        for (i, sst) in SSTS.iter().enumerate() {
-            let mut memtable = AVL::new(MAX_MEMTABLE_THRESHOLD);
-            for (i, (k, v)) in sst.iter().enumerate() {
+    fn expected_state(
+        ssts: &[Vec<(Vec<u8>, Option<Vec<u8>>)>],
+    ) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        let mut state = BTreeMap::new();
+
+        for sst in ssts {
+            for (k, v) in sst {
+                state.insert(k.clone(), v.clone());
+            }
+        }
+        state
+    }
+    fn write_ssts<K, V, S>(path: &Path, ssts: &[S]) -> Vec<SSTable>
+    where
+        S: AsRef<[(K, Option<V>)]>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let mut sstables = Vec::new();
+        for sst in ssts {
+            let mut memtable = AVL::new(TEST_MAX_SST_SIZE);
+            for (k, v) in sst.as_ref() {
                 match v {
-                    None => memtable.delete(k, HLC.tick()),
-                    &Some(v) => {
-                        memtable.put(k, v, HLC.tick());
+                    None => memtable.delete(k.as_ref(), HLC.tick()),
+                    Some(v) => {
+                        memtable.put(k.as_ref(), v.as_ref(), HLC.tick());
                     }
                 }
             }
 
             let (f, sst_path) = memtable.sync_avl(path, HLC.tick()).unwrap().unwrap();
             let sst = SSTable::load(&sst_path).unwrap();
+            sstables.push(sst);
+        }
+        sstables
+    }
+    fn sets_compaction_slices(ssts: &[SSTable]) -> Vec<CompactionSstSlice> {
+        let mut sst_slices = Vec::new();
+
+        for sst in ssts {
             sst_slices.push(CompactionSstSlice {
                 file_path: sst.file_path.clone(),
                 id: sst.id,
@@ -820,13 +848,14 @@ mod tests {
     fn compacts_ssts_and_gives_correct_final_sst() {
         let dir = tempdir().unwrap();
 
-        let sst_slices = sets_compaction_slices(dir.path());
+        let sstables = write_ssts(dir.path(), SSTS);
+        let sst_slices = sets_compaction_slices(&sstables);
         let compaction_job = CompactionJob::new(
             sst_slices,
             1,
             dir.path().to_path_buf(),
             Arc::clone(&HLC),
-            64 * 1024,
+            TEST_MAX_SST_SIZE,
         );
         let mut manager = CompactionManager::new();
         manager.start(compaction_job).unwrap();
@@ -857,7 +886,8 @@ mod tests {
     #[test]
     fn compaction_with_one_corrupted_sst_fails() {
         let dir = tempdir().unwrap();
-        let ssts = sets_compaction_slices(dir.path());
+        let sstables = write_ssts(dir.path(), SSTS);
+        let ssts = sets_compaction_slices(&sstables);
         let corrupted = &ssts[2];
         let (_, block_offset, block_len) = &corrupted.sparse_index[0];
         flip_bit_at(&corrupted.file_path, *block_offset + *block_len / 2);
@@ -867,7 +897,7 @@ mod tests {
             1,
             dir.path().to_path_buf(),
             Arc::clone(&HLC),
-            64 * 1024,
+            TEST_MAX_SST_SIZE,
         );
         let mut manager = CompactionManager::new();
         manager.start(compaction_job).unwrap();
@@ -889,8 +919,56 @@ mod tests {
     }
 
     #[test]
-    fn compacts() {
-        let ssts = generate_big_ssts();
+    fn compacts_into_multiple_final_ssts() {
+        let dir = tempdir().unwrap();
+        let ssts_records = generate_big_ssts();
+
+        let expected_state = expected_state(&ssts_records);
+        assert_eq!(expected_state.len(), 4000);
+        let sstables = write_ssts(dir.path(), &ssts_records);
+        let sst_slices = sets_compaction_slices(&sstables);
+        let compaction_job = CompactionJob::new(
+            sst_slices,
+            1,
+            dir.path().to_path_buf(),
+            Arc::clone(&HLC),
+            TEST_MAX_SST_SIZE,
+        );
+        let mut manager = CompactionManager::new();
+        manager.start(compaction_job).unwrap();
+
+        let outcome = manager.wait_for_handle_finish().unwrap().unwrap();
+
+        assert!(outcome.final_sst_files.len() > 1);
+
+        assert_eq!(outcome.consumed_sst_files.len(), 3);
+
+        let sstable_outputs: Vec<SSTable> = outcome
+            .final_sst_files
+            .iter()
+            .map(|el| SSTable::load(&dir.path().join(format!("{el}.sst"))).unwrap())
+            .collect();
+
+        for (k, v) in &expected_state {
+            let expected_val = match v {
+                Some(v) => Lookup::Found(v.clone()),
+                None => Lookup::Deleted,
+            };
+
+            let sst_that_holds_record: Vec<&SSTable> = sstable_outputs
+                .iter()
+                .filter(|x| {
+                    let (min, max) = x.min_max_keys.as_ref().unwrap();
+                    min <= k && k <= max
+                })
+                .collect();
+
+            assert_eq!(sst_that_holds_record.len(), 1); // no key overlaps
+            assert_eq!(
+                sst_that_holds_record[0].search_kv_in_sstable(k).unwrap(),
+                expected_val
+            );
+        }
     }
 }
 /*

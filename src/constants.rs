@@ -4,7 +4,8 @@ pub const DATA_BLOCK: usize = 8 * 1024; // Data block in SSTable
 pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 =
     DATA_BLOCK as u64 + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + RECORD_HEADER_LEN as u64; // 8192(max db_size) + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + 25 bytes for metadata(timestamp, ksz,vsz,tmbstone); // if we had a db_size of 8191, we could end up with adding a max val and max key
 
-pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 100;
+// pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 100;
+pub const TEST_MAX_SST_SIZE: u64 = 160 * 1024;
 
 pub const COMPACTION_READ_BUFFER_LEN: usize = 64 * 1024;
 pub const TAG_DELETION: u8 = 2;
