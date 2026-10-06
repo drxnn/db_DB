@@ -29,7 +29,7 @@ use crate::wal::{WAL, WalRecordType, WalRecoveryMode, WalReplayState};
 // WAL config for flush
 
 #[derive(Copy, Clone)]
-pub(crate) enum SyncConfig {
+pub enum SyncConfig {
     None,       // fast, data can be lost
     Every(u64), // in ms
     Always,     // Ddurable
@@ -43,15 +43,15 @@ pub enum Lookup {
 }
 
 pub struct KVEngineOptions {
-    sync: SyncConfig,
-    wal_recovery_mode: WalRecoveryMode,
-    memtable_threshold: u64,
-    max_flush_retries: u8,
-    max_frozen_memtables: u8, // whem max is reached, pause writes until we finish at least 1
-    max_sst_size: u64,        // default 100MB
-    l0_compaction_trigger: usize, //default 10, cap it between 2-50
-    max_bytes_for_level_base: u64,
-    level_multiplier: u64, // needs to be more than 2
+    pub sync: SyncConfig,
+    pub wal_recovery_mode: WalRecoveryMode,
+    pub memtable_threshold: u64,
+    pub max_flush_retries: u8,
+    pub max_frozen_memtables: u8, // whem max is reached, pause writes until we finish at least 1
+    pub max_sst_size: u64,        // default 100MB
+    pub l0_compaction_trigger: usize, //default 10, cap it between 2-50
+    pub max_bytes_for_level_base: u64,
+    pub level_multiplier: u64, // needs to be more than 2
 }
 impl Default for KVEngineOptions {
     fn default() -> Self {
@@ -65,6 +65,19 @@ impl Default for KVEngineOptions {
             l0_compaction_trigger: 10,
             max_bytes_for_level_base: 10 * 100 * 1024 * 1024, // base for L1
             level_multiplier: 10,
+        }
+    }
+}
+
+impl KVEngineOptions {
+    pub fn demo() -> Self {
+        Self {
+            memtable_threshold: 256 * 1024,
+            max_sst_size: 256 * 1024,
+            max_bytes_for_level_base: 512 * 1024,
+            level_multiplier: 4,
+            l0_compaction_trigger: 4,
+            ..Default::default()
         }
     }
 }
@@ -139,7 +152,7 @@ impl KVEngineOptions {
     }
 }
 
-struct KVEngine {
+pub struct KVEngine {
     // node_id: have a unique ID here
     data_directory: PathBuf, // data_directory now holds all .sst and .wal files
     sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>,
@@ -156,7 +169,7 @@ struct KVEngine {
 }
 
 impl KVEngine {
-    fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
+    pub(crate) fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
 
         //TODO: make sure we use options now
@@ -403,7 +416,7 @@ impl KVEngine {
         File::open(&self.data_directory)?.sync_all()?;
         Ok(())
     }
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.memtable.get(key) {
             Found(bytes) => return Ok(Some(bytes.to_vec())),
             Deleted => return Ok(None),
@@ -463,7 +476,7 @@ impl KVEngine {
         Ok(())
     }
 
-    fn delete(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) fn delete(&mut self, key: &[u8]) -> Result<()> {
         if let Some(err_str) = &self.db_failed {
             return Err(DbError::ReadOnly(err_str.to_string()));
         }
@@ -941,7 +954,7 @@ impl KVEngine {
         }
     }
 
-    fn close(mut self) -> Result<()> {
+    pub(crate) fn close(mut self) -> Result<()> {
         //
 
         // we have to track the first error that goes wrong, for logging reasons and because we cant stop the close just because there was an error
