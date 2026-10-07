@@ -1,7 +1,9 @@
 mod common;
 
 use common::open;
-use database_engine::{DbError, KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE};
+use database_engine::{
+    DbError, KEY_MAX_BYTES_SIZE, KVEngine, KVEngineOptions, SyncConfig, VALUE_MAX_BYTES_SIZE,
+};
 use tempfile::tempdir;
 #[test]
 fn put_get_overwrite_delete() {
@@ -51,5 +53,38 @@ fn oversized_writes_are_rejected_and_the_db_keeps_working() {
 
     db.put(b"k", b"still works").unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"still works".to_vec()));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_dir_that_is_in_use_cannot_be_opened_again() {
+    let dir = tempdir().unwrap();
+    let mut first = open(dir.path());
+
+    let second = KVEngine::open(
+        dir.path(),
+        KVEngineOptions {
+            sync: SyncConfig::None,
+            ..KVEngineOptions::demo()
+        },
+    );
+    let second_was_refused = second.is_err();
+    if let Ok(second) = second {
+        second.close().unwrap();
+    }
+
+    first.put(b"apple", b"red").unwrap();
+    first.close().unwrap();
+
+    let db = open(dir.path()); // closing the first engine frees the directory again
+    assert_eq!(
+        db.get(b"apple").unwrap(),
+        Some(b"red".to_vec()),
+        "the first engine's write was lost"
+    );
+    assert!(
+        second_was_refused,
+        "a second engine opened a directory that was already in use"
+    );
     db.close().unwrap();
 }

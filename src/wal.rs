@@ -21,6 +21,7 @@ pub(crate) struct WAL {
     sync_c: SyncConfig,
     record_buffer: Vec<u8>,
     threshold: u64,
+    bytes_written: u64,
     pub(crate) path: PathBuf,
     last_sync: Instant,
 }
@@ -48,6 +49,7 @@ impl WAL {
             sync_c,
             path: wal_path,
             last_sync: Instant::now(),
+            bytes_written: 0,
         })
     }
     fn destruct(mut self) -> Result<()> {
@@ -62,6 +64,9 @@ impl WAL {
         Ok(())
     }
 
+    pub(crate) fn is_full(&self) -> bool {
+        self.bytes_written >= self.threshold
+    }
     pub(crate) fn record_to_wal<'a>(
         &mut self,
         record: WalRecordType<'a>,
@@ -89,6 +94,7 @@ impl WAL {
 
         let crc = CRC32.compute_crc_data_block(record_buffer);
         record_buffer.extend_from_slice(&crc.to_le_bytes());
+        self.bytes_written += record_buffer.len() as u64;
 
         match self.wal_writer.as_mut() {
             Some(writer) => {
@@ -302,7 +308,7 @@ mod tests {
 
     use crate::{
         constants::MAX_MEMTABLE_THRESHOLD,
-        lsm::Lookup::{Deleted, Found},
+        lsm::Lookup::{Absent, Deleted, Found},
         test_utils::flip_bit_at,
     };
     use std::{assert_eq, collections::HashMap, fs, matches};
@@ -444,6 +450,48 @@ mod tests {
             assert_eq!(replay.records_recovered, 0);
         }
     }
+
+    #[test]
+    fn torn_last_record_replays_everything_before_it() {
+        // a crash in the middle of an append leaves the last record half written
+        let (_dir, mut wal) = create_wal();
+        let mut len_before_last_record = 0;
+        for (ts, (key, value)) in WAL_RECORDS.iter().enumerate() {
+            if ts == WAL_RECORDS.len() - 1 {
+                len_before_last_record = fs::metadata(&wal.path).unwrap().len();
+            }
+            let record = match value {
+                Some(v) => WalRecordType::Insertion(key, v),
+                None => WalRecordType::Deletion(key),
+            };
+            wal.record_to_wal(record, ts as u64).unwrap();
+        }
+        let full_len = fs::metadata(&wal.path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&wal.path).unwrap();
+
+        // cut the last record at every possible byte, from just its crc missing down to just its tag left
+        for torn_len in (len_before_last_record + 1..full_len).rev() {
+            file.set_len(torn_len).unwrap();
+
+            let replay = WAL::build_avl_from_wal(&wal.path, MAX_MEMTABLE_THRESHOLD).unwrap();
+            assert!(
+                matches!(
+                    replay.replay_state,
+                    WalReplayState::PartialError(DbError::DataCorrupted(DataCorruptedErr {
+                        reason: CorruptionType::TruncatedRecord,
+                        ..
+                    }))
+                ),
+                "file cut to {torn_len} bytes"
+            );
+            assert_eq!(replay.records_recovered, WAL_RECORDS.len() as u64 - 1);
+            assert_eq!(replay.valid_bytes, len_before_last_record);
+            assert_eq!(replay.most_recent_hlc, Some(WAL_RECORDS.len() as u64 - 2));
+            assert_eq!(replay.memtable.get(b"user:4"), Absent); // the torn record
+            assert_eq!(replay.memtable.get(b"big"), Found(BIG_VALUE.to_vec())); // the record before it
+        }
+    }
+
     #[test]
     fn new_refuses_to_overwrite_existing_wal() {
         let (dir, _wal) = create_wal();

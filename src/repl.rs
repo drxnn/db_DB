@@ -52,7 +52,7 @@ pub(crate) fn run_repl(db: &mut KVEngine) -> io::Result<()> {
 
     loop {
         if is_terminal {
-            println!("> ");
+            print!("> ");
             io::stdout().flush()?;
         }
 
@@ -69,8 +69,8 @@ pub(crate) fn run_repl(db: &mut KVEngine) -> io::Result<()> {
         };
 
         let result = match command {
-            Command::Delete(k) => db.delete(&k.into_bytes()),
-            Command::Put(k, v) => db.put(&k.into_bytes(), &v.into_bytes()),
+            Command::Delete(k) => db.delete(k.as_bytes()).map(|_| println!("OK")),
+            Command::Put(k, v) => db.put(k.as_bytes(), v.as_bytes()).map(|_| println!("OK")),
             Command::Exit => {
                 break;
             }

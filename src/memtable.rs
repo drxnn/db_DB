@@ -464,17 +464,42 @@ mod tests {
         memtable
     }
 
-    fn populated_numbers_memtable() -> AVL {
-        let records_to_add = [
-            (1_u64.to_le_bytes(), 100_u64.to_le_bytes()),
-            (2_u64.to_le_bytes(), 200_u64.to_le_bytes()),
-            (3_u64.to_le_bytes(), 300_u64.to_le_bytes()),
-        ];
+    fn memtable_from(keys: &[&str]) -> AVL {
         let mut memtable = AVL::new(1024);
-        for (i, (k, v)) in records_to_add.iter().enumerate() {
-            memtable.put(k, v, i as u64);
+        for (ts, key) in keys.iter().enumerate() {
+            memtable.put(key.as_bytes(), b"v", ts as u64);
         }
         memtable
+    }
+
+    fn check_avl_invariants(
+        node: &Option<Box<Node>>,
+        low: Option<&[u8]>,
+        high: Option<&[u8]>,
+    ) -> i64 {
+        let Some(n) = node else {
+            return -1;
+        };
+        if let Some(low) = low {
+            assert!(n.entry.key.as_slice() > low, "key out of order");
+        }
+        if let Some(high) = high {
+            assert!(n.entry.key.as_slice() < high, "key out of order");
+        }
+
+        let left_height = check_avl_invariants(&n.left, low, Some(&n.entry.key));
+        let right_height = check_avl_invariants(&n.right, Some(&n.entry.key), high);
+
+        assert!(
+            (left_height - right_height).abs() <= 1,
+            "node is unbalanced"
+        );
+        assert_eq!(
+            n.height as i64,
+            1 + left_height.max(right_height),
+            "stored height is stale"
+        );
+        1 + left_height.max(right_height)
     }
 
     #[test]
@@ -540,8 +565,41 @@ mod tests {
 
     #[test]
     fn each_rotation_case_works() {
-        let memtable = populated_numbers_memtable();
-        // 1,2,3
-        // need a helper that returns nodes in order
+        // every insertion order below is unbalanced in a different way, and each one has to end up as 1 <- 2(root) -> 3
+        let cases = [
+            ("left-left, single right rotation", ["3", "2", "1"]),
+            ("right-right, single left rotation", ["1", "2", "3"]),
+            ("left-right, double rotation", ["3", "1", "2"]),
+            ("right-left, double rotation", ["1", "3", "2"]),
+        ];
+        for (case, keys) in cases {
+            let memtable = memtable_from(&keys);
+            let root = memtable.root.as_ref().unwrap();
+            assert_eq!(root.entry.key, b"2", "{case}");
+            assert_eq!(root.left.as_ref().unwrap().entry.key, b"1", "{case}");
+            assert_eq!(root.right.as_ref().unwrap().entry.key, b"3", "{case}");
+            check_avl_invariants(&memtable.root, None, None);
+        }
+
+        // in a 3 node tree a rotation never has to move a subtree, so also check bigger trees where it does
+        let ascending: Vec<String> = (0..1000).map(|i| format!("{i:04}")).collect();
+        let descending: Vec<String> = ascending.iter().rev().cloned().collect();
+        let zigzag: Vec<String> = (0..500)
+            .flat_map(|i| [format!("{i:04}"), format!("{:04}", 999 - i)])
+            .collect();
+
+        for keys in [ascending, descending, zigzag] {
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let memtable = memtable_from(&keys);
+            check_avl_invariants(&memtable.root, None, None);
+            assert_eq!(memtable.size, 1000);
+            for key in &keys {
+                assert_eq!(
+                    memtable.get(key.as_bytes()),
+                    Found(b"v".to_vec()),
+                    "lost key {key}"
+                );
+            }
+        }
     }
 }

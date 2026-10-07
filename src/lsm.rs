@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, remove_file, rename};
+use std::fs::{self, File, OpenOptions, TryLockError, remove_file, rename};
 
 use std::path::{Path, PathBuf};
 
@@ -52,6 +52,7 @@ pub struct KVEngineOptions {
     pub l0_compaction_trigger: usize, //default 10, cap it between 2-50
     pub max_bytes_for_level_base: u64,
     pub level_multiplier: u64, // needs to be more than 2
+    pub l0_stop_writes_trigger: usize,
 }
 impl Default for KVEngineOptions {
     fn default() -> Self {
@@ -65,6 +66,7 @@ impl Default for KVEngineOptions {
             l0_compaction_trigger: 10,
             max_bytes_for_level_base: 10 * 100 * 1024 * 1024, // base for L1
             level_multiplier: 10,
+            l0_stop_writes_trigger: 30,
         }
     }
 }
@@ -140,6 +142,16 @@ impl KVEngineOptions {
             }
             .into());
         }
+
+        if self.l0_stop_writes_trigger <= self.l0_compaction_trigger {
+            return Err(
+                InvalidOptions::L0WritesStopTriggerSmallerThanL0CompactionTrigger {
+                    found: self.l0_stop_writes_trigger,
+                    min: self.l0_compaction_trigger,
+                }
+                .into(),
+            );
+        }
         if self.max_bytes_for_level_base < self.max_sst_size {
             return Err(InvalidOptions::MaxBytesForLevelSmallerThanSstSize {
                 max_bytes_for_level_base: self.max_bytes_for_level_base,
@@ -166,6 +178,7 @@ pub struct KVEngine {
     db_failed: Option<String>, //
     manifest: Manifest,
     options: KVEngineOptions,
+    _lock: File,
 }
 #[derive(Debug)]
 pub struct EngineStats {
@@ -196,6 +209,17 @@ impl KVEngine {
 
         //TODO: make sure we use options now
         options.validate()?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dir_name.join("LOCK"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(DbError::DirectoryLocked(dir_name.to_path_buf()));
+            }
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
 
         let mut sstables: [Vec<SSTable>; SST_LEVEL_COUNT] = [const { Vec::new() }; SST_LEVEL_COUNT];
 
@@ -288,6 +312,7 @@ impl KVEngine {
             compaction_manager: CompactionManager::new(),
             db_failed: None,
             options,
+            _lock: lock,
         };
 
         for (_, path) in live_ssts {
@@ -469,6 +494,7 @@ impl KVEngine {
 
         if (key.len() as u64 + value.len() as u64 + self.memtable.size_in_bytes)
             > self.memtable.threshold
+            || self.wal.is_full()
         {
             self.rotate_memtable_and_wal()?; // if it returns DbError::WritesStalled, have caller handle(maybe retry again in a couple ms)
         }
@@ -505,7 +531,7 @@ impl KVEngine {
         self.maintenance()?;
         let k_len = key.len() as u64;
         self.memtable.exceeds_max(k_len, 0)?;
-        if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold {
+        if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold || self.wal.is_full() {
             self.rotate_memtable_and_wal()?;
         }
         // let tstamp = new_timestamp();
@@ -536,8 +562,22 @@ impl KVEngine {
             if self.frozen_memtables.len() >= max {
                 return Err(DbError::WritesStalled {
                     frozen_memtables: self.frozen_memtables.len(),
+                    l0_files: self.l0_file_count(),
                 });
             }
+        }
+
+        let l0_files = self.sstables.as_ref().unwrap().read().unwrap()[0].len();
+        if l0_files >= self.options.l0_stop_writes_trigger {
+            self.compact()?;
+            return Err(DbError::WritesStalled {
+                frozen_memtables: self.frozen_memtables.len(),
+                l0_files,
+            });
+        }
+        if let Err(e) = self.wal.sync() {
+            self.fail(format!("WAL sync failed while rotating: {e}"));
+            return Err(e);
         }
         let old_wal = std::mem::replace(
             &mut self.wal,
@@ -549,6 +589,7 @@ impl KVEngine {
             )?,
         );
         let wal_id = old_wal.id;
+
         drop(old_wal);
 
         // WHEN MAIN(whoever polls it) RECEIVES A SUCCESSFUL FLUSH, REMOVE THE OLD WAL ASSOCIATED WITH THAT FLUSH
@@ -584,7 +625,11 @@ impl KVEngine {
 
         Ok(())
     }
-
+    fn l0_file_count(&self) -> usize {
+        self.sstables
+            .as_ref()
+            .map_or(0, |levels| levels.read().unwrap()[0].len())
+    }
     fn does_overlap(sstable: &SSTable, min_k: &[u8], max_k: &[u8]) -> bool {
         if let Some((other_ss_min_k, other_ss_max_k)) = sstable.min_max_keys.as_ref() {
             return other_ss_min_k.as_slice() <= max_k && min_k <= other_ss_max_k.as_slice();

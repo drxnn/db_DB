@@ -104,6 +104,10 @@ pub enum InvalidOptions {
         max_bytes_for_level_base: u64,
         max_sst_size: u64,
     },
+    L0WritesStopTriggerSmallerThanL0CompactionTrigger {
+        found: usize,
+        min: usize,
+    },
 }
 
 impl From<InvalidOptions> for DbError {
@@ -136,10 +140,18 @@ pub enum DbError {
     NonNumericFileIdOnSstable(PathBuf),
     InvalidSstableFileName(PathBuf),
     InvalidMemtableInput(InvalidMemtableInput),
-    OutOfBoundsRead { start: u64, end: u64, len: u64 }, // TODO: extend this to be more elaborate
+    OutOfBoundsRead {
+        start: u64,
+        end: u64,
+        len: u64,
+    }, // TODO: extend this to be more elaborate
     ManifestError(String), // TODO: make more elaborate = different kinds of ManifestErrs
     InvalidOptions(InvalidOptions),
-    WritesStalled { frozen_memtables: usize },
+    WritesStalled {
+        frozen_memtables: usize,
+        l0_files: usize,
+    },
+    DirectoryLocked(PathBuf),
 }
 #[derive(Debug)]
 
@@ -416,12 +428,28 @@ impl fmt::Display for DbError {
                         "Invalid options: Limit for max_flush_retries is {max}. Found: {found}"
                     )
                 }
+                InvalidOptions::L0WritesStopTriggerSmallerThanL0CompactionTrigger {
+                    found,
+                    min,
+                } => write!(
+                    f,
+                    "Invalid Options: The trigger that stops writes to L0 is smaller than its compation trigger. Found:{found}. Min required:{min}"
+                ),
             },
-            Self::WritesStalled { frozen_memtables } => {
+            Self::WritesStalled {
+                frozen_memtables,
+                l0_files,
+            } => {
                 write!(
                     f,
-                    "Writes to the database are stalled for the moment due to max of frozen_memtables reached. Frozen_memtables count: {}. Writes will continue when there is space available",
-                    frozen_memtables
+                    "Writes are stalled until background work catches up. Frozen memtables waiting to flush: {frozen_memtables}. Files in L0: {l0_files}. Retry shortly"
+                )
+            }
+            Self::DirectoryLocked(p) => {
+                write!(
+                    f,
+                    "Tried to open directory that is locked by another process. Path: {}",
+                    p.display()
                 )
             }
         }
