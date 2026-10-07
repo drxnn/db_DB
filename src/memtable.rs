@@ -18,9 +18,9 @@ use crate::{
 
 pub struct AVL {
     root: Option<Box<Node>>,
-    pub threshold: u64,
-    size: u64,
-    pub size_in_bytes: u64,
+    pub(crate) threshold: u64,
+    pub(crate) size: u64,
+    pub(crate) size_in_bytes: u64,
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {

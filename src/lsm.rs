@@ -167,9 +167,31 @@ pub struct KVEngine {
     manifest: Manifest,
     options: KVEngineOptions,
 }
+#[derive(Debug)]
+pub struct EngineStats {
+    pub files_per_level: Vec<usize>,
+    pub bytes_per_level: Vec<u64>,
+    pub frozen_memtables: usize,
+    pub active_memtable_number_of_records: u64,
+}
 
 impl KVEngine {
-    pub(crate) fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
+    pub fn stats(&self) -> EngineStats {
+        let levels = self.sstables.as_ref().unwrap().read().unwrap();
+        EngineStats {
+            files_per_level: levels.iter().map(|l| l.len()).collect(),
+            bytes_per_level: levels
+                .iter()
+                .map(|l| l.iter().map(|s| s.file_size).sum())
+                .collect(),
+            frozen_memtables: self.frozen_memtables.len(),
+            active_memtable_number_of_records: self.memtable.size,
+        }
+    }
+}
+
+impl KVEngine {
+    pub fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
 
         //TODO: make sure we use options now
@@ -416,7 +438,7 @@ impl KVEngine {
         File::open(&self.data_directory)?.sync_all()?;
         Ok(())
     }
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.memtable.get(key) {
             Found(bytes) => return Ok(Some(bytes.to_vec())),
             Deleted => return Ok(None),
@@ -476,7 +498,7 @@ impl KVEngine {
         Ok(())
     }
 
-    pub(crate) fn delete(&mut self, key: &[u8]) -> Result<()> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         if let Some(err_str) = &self.db_failed {
             return Err(DbError::ReadOnly(err_str.to_string()));
         }
@@ -925,7 +947,7 @@ impl KVEngine {
             Err(e) => Err(e),
         }
     }
-    fn maintenance(&mut self) -> Result<()> {
+    pub fn maintenance(&mut self) -> Result<()> {
         //
         // check flushing thread first
 
@@ -954,7 +976,7 @@ impl KVEngine {
         }
     }
 
-    pub(crate) fn close(mut self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
         //
 
         // we have to track the first error that goes wrong, for logging reasons and because we cant stop the close just because there was an error

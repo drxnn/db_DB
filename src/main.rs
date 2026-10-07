@@ -3,6 +3,8 @@ use std::{format, path::PathBuf};
 use clap::{Parser, ValueEnum};
 use database_engine::{KVEngine, KVEngineOptions, SyncConfig, WalRecoveryMode};
 
+use crate::repl::run_repl;
+mod repl;
 #[derive(Parser)]
 #[command(version, about = "An LSM-tree key-value store")]
 struct Args {
@@ -148,4 +150,13 @@ fn parse_size(size: &str) -> Result<u64, String> {
         .checked_mul(unit)
         .ok_or_else(|| format!("size is too large. Size used: {size}"))
 }
-fn main() {}
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    std::fs::create_dir_all(&args.dir)?;
+
+    let mut db = KVEngine::open(&args.dir, args.options())?;
+    run_repl(&mut db)?;
+
+    db.close()?;
+    Ok(())
+}
