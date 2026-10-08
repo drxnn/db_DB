@@ -27,7 +27,7 @@ impl SsTableDataBlock {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.size > DATA_BLOCK as usize
+        self.size > DATA_BLOCK
     }
 
     pub fn full_data_block(mut self) -> Self {

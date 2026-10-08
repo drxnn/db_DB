@@ -20,7 +20,7 @@ use crate::errors::CompactionErr::{self};
 
 use crate::constants::{
     BLOOM_BITS_PER_KEY, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
-    TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
+    SST_LEVEL_COUNT, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
 };
 use crate::errors::CrcType;
 use crate::helpers::{
@@ -588,59 +588,71 @@ impl CompactionJob {
         }; // nothing to compact
         let min_k = first.0.entry.key.clone();
 
-        let mut sst_finalizer = SstFinalizer::new(
-            &data_dir,
-            min_k,
-            &hlc,
-            compaction_outcome.level_for_output_sst,
-            max_sst_size,
-        )?;
+        let mut sst_finalizer: Option<SstFinalizer> = None;
+        // let mut sst_finalizer = SstFinalizer::new(
+        //     &data_dir,
+        //     min_k,
+        //     &hlc,
+        //     compaction_outcome.level_for_output_sst,
+        //     max_sst_size,
+        // )?;
 
-        compaction_outcome.final_sst_files.push(sst_finalizer.id);
+        // compaction_outcome.final_sst_files.push(sst_finalizer.id);
         let mut last_k_written: Option<Vec<u8>> = None;
+        let is_bottom_level =
+            compaction_outcome.level_for_output_sst as usize == SST_LEVEL_COUNT - 1;
 
         while let Some(curr_merge_item) = heap.pop().as_mut() {
             if last_k_written.as_ref() != Some(&curr_merge_item.0.entry.key) {
-                let record = curr_merge_item.0.serialize_record()?;
-                if sst_finalizer.would_exceed_max_sst_size(record.len() as u64) {
-                    Self::finalize_output_merged_file(sst_finalizer)?;
+                if !(is_bottom_level && curr_merge_item.0.entry.deleted) {
+                    let record = curr_merge_item.0.serialize_record()?;
 
-                    sst_finalizer = SstFinalizer::new(
-                        &data_dir,
-                        curr_merge_item.0.entry.key.clone(),
-                        &hlc,
-                        compaction_outcome.level_for_output_sst,
-                        max_sst_size,
-                    )?;
-                    compaction_outcome.final_sst_files.push(sst_finalizer.id);
-                }
-
-                sst_finalizer
-                    .hashed_keys
-                    .push(hash_key(&curr_merge_item.0.entry.key));
-
-                match sst_finalizer.data_block.is_finished() {
-                    true => {
-                        //TODO: can be a function
-                        let mut new_ss_db = SsTableDataBlock::new(&curr_merge_item.0.entry.key);
-                        new_ss_db.append_to_block(&record);
-                        let old_data_block = mem::replace(&mut sst_finalizer.data_block, new_ss_db);
-
-                        let data_len = old_data_block.bytes.get_ref().len() as u64; // before 4 byte crc
-
-                        let full = old_data_block.full_data_block();
-                        sst_finalizer.writer.write_all(full.bytes.get_ref())?;
-                        sst_finalizer.sparse_index.add_entry(
-                            &full.starting_key,
-                            data_len,
-                            sst_finalizer.offset,
-                        );
-                        let full_bytes_len = full.bytes.get_ref().len() as u64;
-                        sst_finalizer.offset += full_bytes_len;
-                        sst_finalizer.bytes_written_to_file += full_bytes_len;
+                    if let Some(full) = sst_finalizer.take_if(|finalizer| {
+                        finalizer.would_exceed_max_sst_size(record.len() as u64)
+                    }) {
+                        Self::finalize_output_merged_file(full)?;
                     }
-                    false => {
-                        sst_finalizer.data_block.append_to_block(&record);
+                    if sst_finalizer.is_none() {
+                        let new_finalizer = SstFinalizer::new(
+                            &data_dir,
+                            curr_merge_item.0.entry.key.clone(),
+                            &hlc,
+                            compaction_outcome.level_for_output_sst,
+                            max_sst_size,
+                        )?;
+                        compaction_outcome.final_sst_files.push(new_finalizer.id);
+                        sst_finalizer = Some(new_finalizer);
+                    }
+                    let sst_finalizer = sst_finalizer.as_mut().expect("set just above");
+
+                    sst_finalizer
+                        .hashed_keys
+                        .push(hash_key(&curr_merge_item.0.entry.key));
+
+                    match sst_finalizer.data_block.is_finished() {
+                        true => {
+                            //TODO: can be a function
+                            let mut new_ss_db = SsTableDataBlock::new(&curr_merge_item.0.entry.key);
+                            new_ss_db.append_to_block(&record);
+                            let old_data_block =
+                                mem::replace(&mut sst_finalizer.data_block, new_ss_db);
+
+                            let data_len = old_data_block.bytes.get_ref().len() as u64; // before 4 byte crc
+
+                            let full = old_data_block.full_data_block();
+                            sst_finalizer.writer.write_all(full.bytes.get_ref())?;
+                            sst_finalizer.sparse_index.add_entry(
+                                &full.starting_key,
+                                data_len,
+                                sst_finalizer.offset,
+                            );
+                            let full_bytes_len = full.bytes.get_ref().len() as u64;
+                            sst_finalizer.offset += full_bytes_len;
+                            sst_finalizer.bytes_written_to_file += full_bytes_len;
+                        }
+                        false => {
+                            sst_finalizer.data_block.append_to_block(&record);
+                        }
                     }
                 }
 
@@ -664,7 +676,9 @@ impl CompactionJob {
             }; // err
         }
 
-        Self::finalize_output_merged_file(sst_finalizer)?;
+        if let Some(finalizer) = sst_finalizer {
+            Self::finalize_output_merged_file(finalizer)?;
+        }
         // put paths into vec
         // compaction_outcome.final_sst_files.push(sst_paths);
 
@@ -829,6 +843,24 @@ mod tests {
         }
         sstables
     }
+
+    fn run_bottom_level_compaction(
+        dir: &Path,
+        ssts: &[&[(&[u8], Option<&[u8]>)]],
+    ) -> CompactionOutcome {
+        let sstables = write_ssts(dir, ssts);
+        let job = CompactionJob::new(
+            sets_compaction_slices(&sstables),
+            (crate::constants::SST_LEVEL_COUNT - 1) as u8,
+            dir.to_path_buf(),
+            Arc::clone(&HLC),
+            TEST_MAX_SST_SIZE,
+        );
+        let mut manager = CompactionManager::new();
+        manager.start(job).unwrap();
+        manager.wait_for_handle_finish().unwrap().unwrap()
+    }
+
     fn sets_compaction_slices(ssts: &[SSTable]) -> Vec<CompactionSstSlice> {
         let mut sst_slices = Vec::new();
 
@@ -969,6 +1001,72 @@ mod tests {
                 expected_val
             );
         }
+    }
+
+    #[test]
+    fn bottom_level_compaction_drops_tombstones_without_resurrecting_older_values() {
+        let dir = tempdir().unwrap();
+        let outcome = run_bottom_level_compaction(
+            dir.path(),
+            &[
+                &[
+                    (b"a", Some(b"1")),
+                    (b"b", Some(b"2")),
+                    (b"c", Some(b"3")),
+                    (b"d", Some(b"4")),
+                ], // older
+                &[
+                    (b"b", None),
+                    (b"c", Some(b"33")),
+                    (b"e", Some(b"5")),
+                    (b"d", None),
+                ], // newer
+            ],
+        );
+        assert_eq!(
+            outcome.consumed_sst_files.len(),
+            2,
+            "every input must be read to the end"
+        );
+
+        let outputs: Vec<SSTable> = outcome
+            .final_sst_files
+            .iter()
+            .map(|id| SSTable::load(&dir.path().join(format!("{id}.sst"))).unwrap())
+            .collect();
+        let get = |k: &[u8]| {
+            outputs
+                .iter()
+                .map(|s| s.search_kv_in_sstable(k).unwrap())
+                .find(|l| *l != Lookup::Absent)
+                .unwrap_or(Lookup::Absent)
+        };
+        assert_eq!(get(b"a"), Lookup::Found(b"1".to_vec())); //
+        assert_eq!(
+            get(b"b"),
+            Lookup::Absent,
+            "the tombstone and the value it deleted must both be gone"
+        );
+        assert_eq!(get(b"c"), Lookup::Found(b"33".to_vec()));
+        assert_eq!(get(b"d"), Lookup::Absent);
+        assert_eq!(get(b"e"), Lookup::Found(b"5".to_vec()));
+    }
+
+    #[test]
+    fn bottom_level_compaction_of_only_deleted_keys_writes_no_file() {
+        let dir = tempdir().unwrap();
+        let outcome = run_bottom_level_compaction(
+            dir.path(),
+            &[
+                &[(b"a", Some(b"1")), (b"b", Some(b"2"))],
+                &[(b"a", None), (b"b", None)],
+            ],
+        );
+        assert_eq!(outcome.consumed_sst_files.len(), 2);
+        assert!(
+            outcome.final_sst_files.is_empty(),
+            "nothing is left to write"
+        );
     }
 }
 /*

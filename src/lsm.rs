@@ -385,6 +385,8 @@ impl KVEngine {
     }
     fn retrieve_wal_records(&mut self, wals: &[(u64, PathBuf)]) -> Result<Vec<SSTable>> {
         let mut recovered = Vec::new();
+        let mut wal_files_replayed = 0;
+        let mut records_recovered = 0;
         for (index, (id, path)) in wals.iter().enumerate() {
             let replay = WAL::build_avl_from_wal(path, self.options.memtable_threshold)?;
 
@@ -421,6 +423,8 @@ impl KVEngine {
                 deleted_files: vec![],
                 min_live_wal: Some(id + 1),
             })?;
+            wal_files_replayed += 1;
+            records_recovered += replay.records_recovered;
 
             if should_stop_replaying {
                 fs::rename(path, path.with_extension("wal.corrupt"))?;
@@ -429,6 +433,9 @@ impl KVEngine {
             let _ = fs::remove_file(path);
         }
 
+        if wal_files_replayed > 0 {
+            println!("Recovered {records_recovered} records from {wal_files_replayed} WAL files");
+        }
         Ok(recovered)
     }
 
