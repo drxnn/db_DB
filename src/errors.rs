@@ -8,6 +8,8 @@ use std::{
     write, writeln,
 };
 
+use crate::constants::MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS;
+
 #[derive(Debug)]
 
 pub struct DataCorruptedErr {
@@ -107,6 +109,9 @@ pub enum InvalidOptions {
     L0WritesStopTriggerSmallerThanL0CompactionTrigger {
         found: usize,
         min: usize,
+    },
+    MaxWaitTimeForWriteIfStalledInMsTooLarge {
+        found: u64,
     },
 }
 
@@ -435,6 +440,13 @@ impl fmt::Display for DbError {
                     f,
                     "Invalid Options: The trigger that stops writes to L0 is smaller than its compation trigger. Found:{found}. Min required:{min}"
                 ),
+                InvalidOptions::MaxWaitTimeForWriteIfStalledInMsTooLarge { found } => {
+                    write!(
+                        f,
+                        "Invalid Options: Maximum wait time for a write during a stall cannot exceed {}. Found: {}",
+                        MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS, found
+                    )
+                }
             },
             Self::WritesStalled {
                 frozen_memtables,

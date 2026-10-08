@@ -5,13 +5,16 @@ use std::fs::{self, File, OpenOptions, TryLockError, remove_file, rename};
 use std::path::{Path, PathBuf};
 
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+use std::todo;
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
 use crate::constants::{
     DATA_BLOCK_MAX_BYTES_SIZE, KEY_MAX_BYTES_SIZE, MAX_FLUSH_ATTEMPTS, MAX_FROZEN_MEMTABLES_LIMIT,
     MAX_L0_COMPACTION_TRIGGER, MAX_LEVEL_MULTIPLIER, MAX_MEMTABLE_THRESHOLD,
-    MIN_L0_COMPACTION_TRIGGER, MIN_LEVEL_MULTIPLIER, RECORD_HEADER_LEN, SST_EXT, SST_LEVEL_COUNT,
-    TMP_EXT, VALUE_MAX_BYTES_SIZE, WAL_EXT,
+    MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS, MIN_L0_COMPACTION_TRIGGER, MIN_LEVEL_MULTIPLIER,
+    RECORD_HEADER_LEN, SST_EXT, SST_LEVEL_COUNT, TMP_EXT, VALUE_MAX_BYTES_SIZE, WAL_EXT,
 };
 
 use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidOptions, Result};
@@ -53,6 +56,7 @@ pub struct KVEngineOptions {
     pub max_bytes_for_level_base: u64,
     pub level_multiplier: u64, // needs to be more than 2
     pub l0_stop_writes_trigger: usize,
+    pub stalled_writes_retry_max_time_in_ms: u64,
 }
 impl Default for KVEngineOptions {
     fn default() -> Self {
@@ -67,6 +71,7 @@ impl Default for KVEngineOptions {
             max_bytes_for_level_base: 10 * 100 * 1024 * 1024, // base for L1
             level_multiplier: 10,
             l0_stop_writes_trigger: 30,
+            stalled_writes_retry_max_time_in_ms: 512,
         }
     }
 }
@@ -156,6 +161,13 @@ impl KVEngineOptions {
             return Err(InvalidOptions::MaxBytesForLevelSmallerThanSstSize {
                 max_bytes_for_level_base: self.max_bytes_for_level_base,
                 max_sst_size: self.max_sst_size,
+            }
+            .into());
+        }
+
+        if self.stalled_writes_retry_max_time_in_ms > MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS {
+            return Err(InvalidOptions::MaxWaitTimeForWriteIfStalledInMsTooLarge {
+                found: self.stalled_writes_retry_max_time_in_ms,
             }
             .into());
         }
@@ -490,6 +502,33 @@ impl KVEngine {
         self.search_for_kv_in_sstables(key) // if we get here, 
     }
 
+    pub(crate) fn retry_write_if_stalled(&mut self, record_len: u64) -> Result<()> {
+        // let sleep_time
+
+        if (record_len + self.memtable.size_in_bytes) <= self.memtable.threshold
+            && !self.wal.is_full()
+        {
+            return Ok(());
+        }
+        let deadline = Instant::now()
+            + Duration::from_millis(self.options.stalled_writes_retry_max_time_in_ms);
+        let mut ms_time: u64 = 1;
+        loop {
+            match self.rotate_memtable_and_wal() {
+                err @ Err(DbError::WritesStalled { .. }) => {
+                    if Instant::now() > deadline {
+                        return err;
+                    }
+
+                    sleep(Duration::from_millis(ms_time));
+                    self.maintenance()?;
+                }
+                result => return result,
+            }
+            ms_time = (ms_time * 2).min(40) // check every 40 ms until we hit our max
+        }
+    }
+
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if let Some(err_msg) = &self.db_failed {
             return Err(DbError::ReadOnly(err_msg.to_string()));
@@ -499,12 +538,7 @@ impl KVEngine {
         self.memtable
             .exceeds_max(key.len() as u64, value.len() as u64)?;
 
-        if (key.len() as u64 + value.len() as u64 + self.memtable.size_in_bytes)
-            > self.memtable.threshold
-            || self.wal.is_full()
-        {
-            self.rotate_memtable_and_wal()?; // if it returns DbError::WritesStalled, have caller handle(maybe retry again in a couple ms)
-        }
+        self.retry_write_if_stalled(key.len() as u64 + value.len() as u64)?;
 
         let hlc = self.hlc.tick();
         match self
@@ -538,9 +572,7 @@ impl KVEngine {
         self.maintenance()?;
         let k_len = key.len() as u64;
         self.memtable.exceeds_max(k_len, 0)?;
-        if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold || self.wal.is_full() {
-            self.rotate_memtable_and_wal()?;
-        }
+        self.retry_write_if_stalled(key.len() as u64)?;
         // let tstamp = new_timestamp();
         let hlc = self.hlc.tick();
         match self.wal.record_to_wal(WalRecordType::Deletion(key), hlc) {

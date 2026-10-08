@@ -201,13 +201,12 @@ This is a portfolio/learning project. It focuses on the core functionality of an
 
 1. No group commits: As of this comment, there are no group commits for the engine, so if `SyncConfig` is set to `Always`, it will be much slower in comparison to `SyncConfig::None`. This is to be added.
 2. No range scans: Only per-key `get()`. This is to be added.
-3. If we hit WritesStalled, the engine doesn't retry and instead just refuses the write. This is to be changed.
-4. No compression of data
-5. Uses an AVL tree instead of a SkipList. To be changed.
-6. Only one compaction is running at a time
-7. Only 2 WalRecovery modes. (`WalRecoveryMode::AbsoluteConsistency` refuses to open on any corruption error, `WalRecoveryMode::PointInTime` recovers to the last non-corrupt record and throws away all newer writes)
-8. Corrupt sparse indexes can’t be repaired.
-9. One corrupt file stops all writes
-10. Not distributed.
+3. No compression of data
+4. Uses an AVL tree instead of a SkipList. To be changed.
+5. Only one compaction is running at a time
+6. Only 2 WalRecovery modes. (`WalRecoveryMode::AbsoluteConsistency` refuses to open on any corruption error, `WalRecoveryMode::PointInTime` recovers to the last non-corrupt record and throws away all newer writes)
+7. Corrupt sparse indexes can’t be repaired.
+8. One corrupt file stops all writes
+9. Not distributed.
 
 and many more.

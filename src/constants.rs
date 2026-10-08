@@ -6,6 +6,7 @@ pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 =
 
 // pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 100;
 pub const TEST_MAX_SST_SIZE: u64 = 160 * 1024;
+pub const MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS: u64 = 2048;
 
 pub const COMPACTION_READ_BUFFER_LEN: usize = 64 * 1024;
 pub const TAG_DELETION: u8 = 2;
