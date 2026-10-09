@@ -15,5 +15,5 @@ mod wal;
 
 pub use constants::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE};
 pub use errors::{DbError, Result};
-pub use lsm::{KVEngine, KVEngineOptions, SyncConfig};
+pub use lsm::{KVEngine, KVEngineOptions, KeyLocation, SyncConfig};
 pub use wal::WalRecoveryMode;

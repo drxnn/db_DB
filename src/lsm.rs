@@ -1089,6 +1089,12 @@ impl KVEngine {
         }
     }
 
+    // checks that there is no compaction, no flushing happening, no frozen mems. // used for benchmarking mostly
+    #[doc(hidden)]
+    pub fn is_idle(&self) -> bool {
+        self.frozen_memtables.is_empty() && !self.compaction_manager.is_busy()
+    }
+
     pub fn close(mut self) -> Result<()> {
         //
 

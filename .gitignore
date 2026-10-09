@@ -3,3 +3,5 @@ notes
 .DS_Store
 /data
 /scripts/*
+# samply recordings
+profile.json.gz

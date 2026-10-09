@@ -56,7 +56,7 @@ pub struct Latencies {
 impl Latencies {
     pub fn new() -> Self {
         Self {
-            histogram: Histogram::new_with_bounds(1, 60_000_000_000, 3).unwrap(), // 60 mil nanoseconds
+            histogram: Histogram::new_with_bounds(1, 60_000_000_000, 3).unwrap(), // 60 second upper bound,
             total: Duration::ZERO,
         }
     }
