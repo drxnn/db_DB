@@ -44,6 +44,13 @@ pub enum Lookup {
     Deleted,
     Absent,
 }
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyLocation {
+    Memtable,
+    FrozenMemtable,
+    Level(u8),
+}
 
 pub struct KVEngineOptions {
     pub sync: SyncConfig,
@@ -502,9 +509,31 @@ impl KVEngine {
         self.search_for_kv_in_sstables(key) // if we get here, 
     }
 
+    #[doc(hidden)]
+    /// only used for benchmarks
+    pub fn locate(&self, key: &[u8]) -> Result<Option<KeyLocation>> {
+        if self.memtable.get(key) != Absent {
+            return Ok(Some(KeyLocation::Memtable));
+        }
+        for instance in self.frozen_memtables.values().rev() {
+            if instance.memtable.get(key) != Absent {
+                return Ok(Some(KeyLocation::FrozenMemtable));
+            }
+        }
+        if let Some(sstables) = &self.sstables {
+            for (level, ssts) in sstables.read().unwrap().iter().enumerate() {
+                for sst in ssts {
+                    if sst.should_search_sstable_file(key)
+                        && sst.search_kv_in_sstable(key)? != Absent
+                    {
+                        return Ok(Some(KeyLocation::Level(level as u8)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
     pub(crate) fn retry_write_if_stalled(&mut self, record_len: u64) -> Result<()> {
-        // let sleep_time
-
         if (record_len + self.memtable.size_in_bytes) <= self.memtable.threshold
             && !self.wal.is_full()
         {

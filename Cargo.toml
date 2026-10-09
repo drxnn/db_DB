@@ -9,4 +9,10 @@ crc = "3.4.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "const_xxh3"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
+hdrhistogram = { version = "7.6.0", default-features = false }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "reads"
+harness = false

@@ -1,12 +1,5 @@
 use core::fmt;
-use std::{
-    error::Error,
-    fmt::{Formatter, write},
-    io,
-    num::ParseIntError,
-    path::PathBuf,
-    write, writeln,
-};
+use std::{error::Error, io, num::ParseIntError, path::PathBuf, write};
 
 use crate::constants::MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS;
 
