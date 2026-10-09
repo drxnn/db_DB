@@ -5,25 +5,25 @@ use crate::{
         CrcType, Result,
     },
 };
-use crc::{CRC_32_ISO_HDLC, Crc, Digest};
+use crc::{CRC_32_ISO_HDLC, Crc, Digest, Table};
 use xxhash_rust::xxh3::xxh3_128;
 pub const NUM_HASHES: usize = 7;
 
 pub struct Crc32 {
-    crc32: Crc<u32>,
+    crc32: Crc<u32, Table<16>>,
 }
 
 impl Crc32 {
     pub const fn new() -> Self {
         Self {
-            crc32: Crc::<u32>::new(&CRC_32_ISO_HDLC),
+            crc32: Crc::<u32, Table<16>>::new(&CRC_32_ISO_HDLC),
         }
     }
 
     pub fn compute_crc_data_block(&self, data: &[u8]) -> u32 {
         self.crc32.checksum(data)
     }
-    pub fn digest(&self) -> Digest<'_, u32> {
+    pub fn digest(&self) -> Digest<'_, u32, Table<16>> {
         self.crc32.digest()
     }
 }
