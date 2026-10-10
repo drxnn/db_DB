@@ -17,6 +17,14 @@ tempfile = "3.27.0"
 name = "reads"
 harness = false
 
+[[bench]]
+name = "writes"
+harness = false
+
+[[bench]]
+name = "crc"
+harness = false
+
 
 [profile.bench]
 debug = true

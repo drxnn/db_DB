@@ -1,6 +1,6 @@
-# This is a persistent key-value store built on an LSM tree
+# db_DB
 
-It uses an AVL tree as a memtable, has a WAL for durability (configurable) and a Manifest for atomic operations regarding compaction or flushing. A Hybrid Logical Clock is used for versioning and ordering data.
+A crash-safe K/V storage engine. It uses an AVL tree as a memtable, has a WAL for durability (configurable) and a Manifest for atomic operations regarding compaction or flushing. A Hybrid Logical Clock is used for versioning and ordering data.
 
 ## Quick Start
 

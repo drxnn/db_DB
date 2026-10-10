@@ -17,7 +17,7 @@ const BENCHMARK_L0_RECORDS_NUM: u64 = 5_000;
 
 struct TestingEngine {
     db: KVEngine,
-    keys_by_location: Vec<(&'static str, Vec<[u8; KEY_LEN]>)>, // placeholder this will be a vector of keys by location(memtable,L0-L3) // also keys that dont exist response time
+    keys_by_location: Vec<(&'static str, Vec<[u8; KEY_LEN]>)>,
     _dir: TempDir,
 }
 
@@ -68,7 +68,7 @@ impl TestingEngine {
 
         for n in 0..written {
             let k = random_key(n);
-            let location = db.locate(&k.as_slice()).unwrap().unwrap();
+            let location = db.locate(k.as_slice()).unwrap().unwrap();
 
             let (_, _, group) = groups.iter_mut().find(|(_, l, _)| *l == location).unwrap();
             group.push(k);
@@ -103,7 +103,7 @@ fn get_by_location(c: &mut Criterion) {
                 total
             })
         });
-        latencies.print_data(&format!("get/{name}"));
+        latencies.print_data(&format!("get/{name}"), "");
     }
     group.finish();
 

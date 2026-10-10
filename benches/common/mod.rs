@@ -19,7 +19,6 @@ pub fn bench_options(sync: SyncConfig) -> KVEngineOptions {
     }
 }
 
-// Need some helpers to put records in db
 pub fn mix(n: u64) -> u64 {
     let mut x = n.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -35,7 +34,6 @@ pub fn random_key(n: u64) -> [u8; KEY_LEN] {
     key
 }
 
-// each put retries so we will measure num of stalls to provide some extra info in case of heavy workload
 pub fn put_through_stalls(db: &mut KVEngine, key: &[u8], value: &[u8]) -> u64 {
     let mut stalls = 0;
     loop {
@@ -52,7 +50,6 @@ pub struct Latencies {
     total: Duration,
 }
 
-// this will be all the latencies, meaning, if do a read on 5 milion records, we will have the total duration for a mean as well as percentiles via the histogram
 impl Latencies {
     pub fn new() -> Self {
         Self {
@@ -73,7 +70,7 @@ impl Latencies {
         self.total += elapsed;
     }
 
-    pub fn print_data(&self, op_name: &str) {
+    pub fn print_data(&self, op_name: &str, extra_info: &str) {
         let hist = &self.histogram;
         if hist.is_empty() {
             return;
@@ -81,7 +78,7 @@ impl Latencies {
 
         let ops_per_sec = hist.len() as f64 / self.total.as_secs_f64();
         println!(
-            "{op_name} n={} ops/s={} mean={} p50={} p90={} p99={} p99.9={} p99.99={} max={}",
+            "{op_name} n={} ops/s={} mean={} p50={} p90={} p99={} p99.9={} p99.99={} max={}. {extra_info}",
             hist.len(),
             ops_per_sec,
             format_ns(hist.mean() as u64),

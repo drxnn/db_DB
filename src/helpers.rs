@@ -29,23 +29,11 @@ impl Crc32 {
 }
 pub static CRC32: Crc32 = Crc32::new();
 
-// pub fn compute_crc_data_block(data: &[u8]) -> u32 {
-//     let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-//     let mut digest = crc32.digest();
-//     digest.update(data);
-//     digest.finalize()
-// }
-
 #[cfg(target_os = "macos")]
-use std::io::Error;
 use std::{
     fs::{File, OpenOptions},
     io::{self, ErrorKind::UnexpectedEof, Read},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize},
-    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -114,7 +102,6 @@ pub fn read_exact_or_truncated(
         }
     })
 }
-// helper for key and value record check only
 
 pub fn check_crc(
     crc_to_check: u32,
