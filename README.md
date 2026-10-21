@@ -21,6 +21,7 @@ A crash-safe K/V storage engine. It uses an AVL tree as a memtable, has a WAL fo
 ![demo](docs/demo.gif)
 
 `python3 scripts/demo.py` runs this demo against the release build, in a throwaway directory: a write load that reaches L3, every key checked, recovery after kill -9, a flipped bit and a torn WAL caught, and tombstones dropped at the bottom level. `PAUSE=1` waits for Enter between steps.
+
 The demo uses small sizes for the config (1 MiB memtable and SSTs, 4 MiB L1, the same as the benchmarks) so the data reaches every level very fast. Every memtable rotation, flush and compaction has fixed costs (mostly fsyncs), so throughput rises with bigger sizes: the same load runs at ~240k writes/s with 4 MiB files instead of ~100k.
 
 ## Quick Start
@@ -269,6 +270,8 @@ Every level costs about the same: the min/max keys and bloom filters skip almost
 | fill, 200k puts of 100 B values | 131k ops/s | 1.92 µs | 6.88 µs |
 | fill, 10k puts of 4 KiB values  | 8k ops/s   | 15.7 µs | 3.94 ms |
 | mixed, 95% gets and 5% puts     | 290k ops/s | 3.00 µs | 6.00 µs |
+
+**Note:** With files this small, flushes and compactions run constantly, so write throughput is lower than it would be with larger Config sizes.
 
 **crc:** the CRC32 of one 8 KiB block, computed one byte at a time vs 16 bytes per step: 13.8 µs vs 1.50 µs. Profiling SST reads with samply showed the checksum taking most of each read, so the engine now uses the 16-bytes-per-step version.
 
