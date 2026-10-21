@@ -2,6 +2,15 @@
 
 A crash-safe K/V storage engine. It uses an AVL tree as a memtable, has a WAL for durability (configurable) and a Manifest for atomic operations regarding compaction or flushing. A Hybrid Logical Clock is used for versioning and ordering data.
 
+[Demo](#demo) · [Quick Start](#quick-start) · [How it works](#how-it-works) · [Hybrid Logical Clock](#hybrid-logical-clock) · [SSTables](#sstables) · [Levels](#levels) · [Compaction](#compaction) · [WAL](#wal) · [Manifest](#manifest) · [Data integrity](#data-integrity-and-failure-handling) · [Tests](#tests) · [Benchmarks](#benchmarks) · [Limitations](#limitations)
+
+## Demo
+
+![demo](docs/demo.gif)
+
+`python3 scripts/demo.py` runs this demo against the release build, in a throwaway directory: a write load that reaches L3, every key checked, recovery after kill -9, a flipped bit and a torn WAL caught, and tombstones dropped at the bottom level. `PAUSE=1` waits for Enter between steps.
+The demo uses small sizes for the config (1 MiB memtable and SSTs, 4 MiB L1, the same as the benchmarks) so the data reaches every level very fast. Every memtable rotation, flush and compaction has fixed costs (mostly fsyncs), so throughput rises with bigger sizes: the same load runs at ~240k writes/s with 4 MiB files instead of ~100k.
+
 ## Quick Start
 
 ```bash
@@ -96,6 +105,30 @@ The SSTables are ordered in 4 levels (L0-L3). Records in L0 are from recently fl
 Each level contains more data than the previous one, with the last level also dropping deleted records during compaction.
 
 The no overlapping keys between L1-L3 files invariant is taken care of by the compaction procedure. When compacting we pick a file from Ln and find every file in Ln+1 that overlaps with it to merge it into a single sorted stream.
+
+## Compaction
+
+Compaction runs on one background thread, one job at a time. It's considered whenever a flush lands in L0 or a compaction finishes; both are committed in `maintenance()`, which runs at the start of every `put` and `delete`.
+
+**Choosing a level.** Each level gets a score, and the level with the highest score of at least 1 is compacted into the next one:
+
+```text
+L0   files in L0 / l0_compaction_trigger                          (default 10 files)
+L1   bytes in L1 / max_bytes_for_level_base                       (default 1000 MiB)
+L2   bytes in L2 / (max_bytes_for_level_base × level_multiplier)  (default × 10)
+L3   bottom level, never compacted further
+```
+
+**Choosing files.**
+
+- L0 -> L1: all L0 files, since they can overlap each other, plus every L1 file that overlaps their combined key range.
+- L1 -> L2 and L2 -> L3: one file from the level, plus every file in the next level that overlaps it. The chosen file is the one with the fewest overlapping bytes per byte of its own, so the least data has to be rewritten(Less write amplification).
+
+**Merging.** The inputs are merged into one sorted stream using a min-heap. When several files hold the same key, only the newest version (highest HLC) is written. The output is split into new SSTs of up to `max_sst_size`. When the output level is L3, tombstones are dropped together with the older values they delete. A corrupt input block aborts the job (see [Read-only mode](#read-only-mode)).
+
+**Committing.** The new SSTs and the removal of the inputs go into the MANIFEST as one edit, ensuring state consistency. Inputs are deleted only after the commit, and any SST the MANIFEST doesn't list is removed on the next open.
+
+**When compaction falls behind**, writes slow down instead of letting L0 grow without limit. Once L0 reaches `l0_stop_writes_trigger` files (default 30), or `max_frozen_memtables` memtables (default 4) are waiting to be flushed, a write waits up to `stalled_writes_retry_max_time_in_ms` (default 512 ms) and then fails with `DbError::WritesStalled`.
 
 ## WAL
 
@@ -194,6 +227,38 @@ cargo test
 
 - put/get/overwrite/delete, oversized writes and the directory lock.
 - A crash test that runs the real binary with tiny demo sizes and `--sync none`, streams writes and deletes into it, and kills it with `SIGKILL` at three different points. It then reopens the directory and checks that every acknowledged write survived.
+
+## Benchmarks
+
+```bash
+cargo bench --bench reads
+cargo bench --bench writes
+cargo bench --bench crc
+```
+
+Measured with criterion, plus an HDR histogram of every operation for the percentiles, on an Apple M4 Pro: a single thread, 16-byte keys, 100-byte values, WAL sync off (`SyncConfig::None`), data in the OS page cache. The engine sizes are scaled down (1 MiB memtable and SSTs, 4 MiB L1) so the data reaches every level (see `benches/common/mod.rs`).
+
+**reads:** 500k records (~70 MB) are loaded into L0–L3, then `get` is timed separately for keys found in each place:
+
+| found in | throughput  | p50     | p99     |
+| -------- | ----------- | ------- | ------- |
+| memtable | 6.74M ops/s | 125 ns  | 209 ns  |
+| L0       | 378k ops/s  | 2.58 µs | 3.12 µs |
+| L1       | 365k ops/s  | 2.62 µs | 5.04 µs |
+| L2       | 344k ops/s  | 2.75 µs | 5.54 µs |
+| L3       | 296k ops/s  | 3.21 µs | 6.46 µs |
+
+Every level costs about the same: the min/max keys and bloom filters skip almost every SST that can't hold the key, so a `get` reads about one data block wherever it ends.
+
+**writes:** `fill` writes random keys into an empty engine while flushes and compactions run, and `mixed` runs gets and overwrites on a preloaded engine:
+
+| workload                        | throughput | p50     | p99     |
+| ------------------------------- | ---------- | ------- | ------- |
+| fill, 200k puts of 100 B values | 131k ops/s | 1.92 µs | 6.88 µs |
+| fill, 10k puts of 4 KiB values  | 8k ops/s   | 15.7 µs | 3.94 ms |
+| mixed, 95% gets and 5% puts     | 290k ops/s | 3.00 µs | 6.00 µs |
+
+**crc:** the CRC32 of one 8 KiB block, computed one byte at a time vs 16 bytes per step: 13.8 µs vs 1.50 µs. Profiling SST reads with samply showed the checksum taking most of each read, so the engine now uses the 16-bytes-per-step version.
 
 ## Limitations
 

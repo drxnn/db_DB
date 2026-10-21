@@ -2,6 +2,6 @@
 notes
 .DS_Store
 /data
-/scripts/*
+/scripts/__pycache__
 # samply recordings
 profile.json.gz
