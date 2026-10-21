@@ -2,7 +2,19 @@
 
 A crash-safe K/V storage engine. It uses an AVL tree as a memtable, has a WAL for durability (configurable) and a Manifest for atomic operations regarding compaction or flushing. A Hybrid Logical Clock is used for versioning and ordering data.
 
-[Demo](#demo) · [Quick Start](#quick-start) · [How it works](#how-it-works) · [Hybrid Logical Clock](#hybrid-logical-clock) · [SSTables](#sstables) · [Levels](#levels) · [Compaction](#compaction) · [WAL](#wal) · [Manifest](#manifest) · [Data integrity](#data-integrity-and-failure-handling) · [Tests](#tests) · [Benchmarks](#benchmarks) · [Limitations](#limitations)
+[Demo](#demo)
+· [Quick Start](#quick-start)
+· [How it works](#how-it-works)
+· [Hybrid Logical Clock](#hybrid-logical-clock)
+· [SSTables](#sstables)
+· [Levels](#levels)
+· [Compaction](#compaction)
+· [WAL](#wal)
+· [Manifest](#manifest)
+· [Data integrity](#data-integrity-and-failure-handling)
+· [Tests](#tests) 
+· [Benchmarks](#benchmarks)
+· [Limitations](#limitations)
 
 ## Demo
 
