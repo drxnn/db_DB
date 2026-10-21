@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use std::todo;
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
 use crate::constants::{
@@ -28,8 +27,6 @@ use crate::manifest::{Manifest, ManifestEdit};
 use crate::memtable::AVL;
 use crate::sstable::SSTable;
 use crate::wal::{WAL, WalRecordType, WalRecoveryMode, WalReplayState};
-
-// WAL config for flush
 
 #[derive(Copy, Clone)]
 pub enum SyncConfig {
@@ -184,8 +181,8 @@ impl KVEngineOptions {
 }
 
 pub struct KVEngine {
-    // node_id: have a unique ID here
-    data_directory: PathBuf, // data_directory now holds all .sst and .wal files
+    // node_id: have a unique ID here, (will be used later)
+    data_directory: PathBuf,
     sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>,
     wal: WAL,
     memtable: AVL,
@@ -226,7 +223,6 @@ impl KVEngine {
     pub fn open(dir_name: &Path, options: KVEngineOptions) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
 
-        //TODO: make sure we use options now
         options.validate()?;
         let lock = OpenOptions::new()
             .create(true)
@@ -247,9 +243,7 @@ impl KVEngine {
         let mut sst_vec: Vec<(u64, PathBuf)> = Vec::new();
         let mut wal_vec: Vec<(u64, PathBuf)> = Vec::new();
 
-        // sort by
         for entry in fs::read_dir(dir_name)? {
-            //
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {
@@ -602,7 +596,7 @@ impl KVEngine {
         let k_len = key.len() as u64;
         self.memtable.exceeds_max(k_len, 0)?;
         self.retry_write_if_stalled(key.len() as u64)?;
-        // let tstamp = new_timestamp();
+
         let hlc = self.hlc.tick();
         match self.wal.record_to_wal(WalRecordType::Deletion(key), hlc) {
             Ok(()) => {}
@@ -622,7 +616,6 @@ impl KVEngine {
     fn rotate_memtable_and_wal(&mut self) -> Result<()> {
         let max = self.options.max_frozen_memtables as usize;
         if self.frozen_memtables.len() >= max {
-            // block writes for a little(caller handles when it receives WritesStalled )
             while let Ok(msg) = self.flushing_manager.rx.try_recv() {
                 self.handle_flushing_message(msg)?;
             }
@@ -660,7 +653,6 @@ impl KVEngine {
 
         drop(old_wal);
 
-        // WHEN MAIN(whoever polls it) RECEIVES A SUCCESSFUL FLUSH, REMOVE THE OLD WAL ASSOCIATED WITH THAT FLUSH
         let frozen = Arc::new(std::mem::replace(
             &mut self.memtable,
             AVL::new(self.options.memtable_threshold),
@@ -673,7 +665,7 @@ impl KVEngine {
             tick,
             FrozenMemtableInstance {
                 sstable: None,
-                wal_id, // remove after its done
+                wal_id,
                 memtable: Arc::clone(&frozen),
                 id: tick,
                 flush_attempts: 0,
@@ -820,10 +812,8 @@ impl KVEngine {
         levels: &RwLockReadGuard<'_, [Vec<SSTable>; SST_LEVEL_COUNT]>,
         level: u8,
     ) -> Result<Option<Vec<CompactionSstSlice>>> {
-        let mut best_candidate: Option<(u64, &SSTable)> = None; // will be made into a struct later
+        let mut best_candidate: Option<(u64, &SSTable)> = None;
         let mut files_to_compact: Option<Vec<&SSTable>> = None;
-        // first  value is the size of the sum of bytes of all files(a level up) that overlap with SSTable
-        // TODO: Remember to mark files picked for compaction
 
         if level == 0 {
             return self.select_files_for_l0_compaction(levels);
@@ -1143,50 +1133,3 @@ impl KVEngine {
         Ok(())
     }
 }
-
-/*Notes:
- // footer is : sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) | sizeof(maxkey) | LevelofSST(1 byte) | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc(4) | metadata_crc(4 bytes) |
-
-DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | tombstone | key | value |  ] ... crc(4) (crc for the entire datablock);
-    pub size: usize,
-SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
-Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
-*/
-
-// SparseIndex => [ firskey:[offset, datablock_length] ]
-
-// TODO: have SparseIndex be -> [firstkey: [offsert(points to start of data_block)] ]
-// then have the data_block be datablock_length | record1| record2 ... crc
-// this way we can reconstruct the sparse_index in the case of a sparse_index corruption because we can just read the records front to back without the need for the sparse_index
-
-// wal record looks like: ksz, vsz, k, v, crc(4 bytes)
-// When you read a data block in the sparse index, remember to account for the 4 crc bytes yourself, they are not accounted forin the length
-/*
-
-
-
-
-
-
-
- For WAL records, we have deletion and insertion types so far. Will use one byte to define type. 00000100(4) = INSERTION. 00000010(2) = DELETION.
- serialized should look like this: TYPE | RECORD
- WAL RECORD can be tstamp | ksz | key |crc (4 bytes) OR it can be  | tstamp | ksz |vsz | key | value | crc(4 bytes)
-
- PROBLEM/UPDATE: make Bufreaders with capacity instead
- TODO: Modularize the components into their own files
- TODO.1: Document how things work
-
-
-Atomics u64
-
-// TODO: when main receives a successful sync from mebtable -> sst, check if curr number of L0 ssts >= NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION, true -> trigger
-
-TODO: USE read_exact_at from FileExt trait in place of every read_exact call()
-// chekc static vs dynamic level sizing(rocksdb)
-// TODO: make sure to document the different parsers and how records are written in different formats in some places. One change somewhere can break things in other palces
-// use consts no magic ns
-// TODO: WRITE TESTS
- //
-
-*/

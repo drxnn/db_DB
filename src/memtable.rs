@@ -398,7 +398,7 @@ impl AVL {
                 bloom_len: (bloom_filter.bits.len() * U64_LEN) as u64,
                 min_key_len: min_k.len() as u64,
                 max_key_len: max_k.len() as u64,
-                level: 0 as u8,
+                level: 0,
             };
             let footer = footer.serialize();
 
@@ -452,7 +452,6 @@ mod tests {
 
     use super::*;
 
-    // use crate::hlc::Hlc;
     fn populated_memtable() -> AVL {
         let records_to_add = [("a", "a1"), ("ab", "ab2"), ("longest", "longest123")];
 

@@ -146,7 +146,6 @@ impl SSTable {
         let max_k_start = min_k_end;
         let max_k_end = max_k_start + footer.max_key_len;
 
-        // let sparse_index: &[u8] = &full_sst_data[0..(size_of_sparse_index as usize)];
         let sparse_index: &[u8] = read_range(&full_sst_data, 0, footer.sparse_index_len as usize)?;
         let sparse_index_crc_check = CRC32.compute_crc_data_block(sparse_index);
 
@@ -166,10 +165,8 @@ impl SSTable {
 
         let bloom_filter_crc_check = CRC32.compute_crc_data_block(bloom_filter);
 
-        // &full_sst_data[(bloom_filter_start as usize)..(bloom_filter_end as usize)];
         let min_key = read_range(&full_sst_data, min_k_start as usize, min_k_end as usize)?;
-        // let min_key = &full_sst_data[(min_k_start as usize)..(min_k_end as usize)];
-        // let max_k = &full_sst_data[(max_k_start as usize)..(max_k_end as usize)];
+
         let max_k = read_range(&full_sst_data, max_k_start as usize, max_k_end as usize)?;
 
         let min_max_key_crc_to_check = CRC32.compute_crc_data_block(read_range(
@@ -208,7 +205,7 @@ impl SSTable {
         };
 
         let parsed_sparse_index =
-            SparseIndex::parse_sparse_index(sparse_index, path.to_path_buf())?; // catch err from caller
+            SparseIndex::parse_sparse_index(sparse_index, path.to_path_buf())?;
         let mut sstable = SSTable {
             id,
             file: f,
@@ -263,7 +260,6 @@ impl SSTable {
         let (data_buffer, crc) = data_block_buffer_and_crc.split_at(data_len as usize);
         let crc_from_buff = u32::from_le_bytes(crc.try_into().unwrap());
 
-        //
         // we read CRC here because data_len above doesnt take into account the 4 bytes for crc
 
         let fresh_crc = CRC32.compute_crc_data_block(data_buffer);
@@ -290,7 +286,7 @@ impl SSTable {
                 }));
             }
 
-            // its actually: [ tstamp(8) | ksz(8) | value_sz(8) |tombstone| key | value |  ]
+            // its: [ tstamp(8) | ksz(8) | value_sz(8) |tombstone| key | value |  ]
             let ksz = read_u64(data_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
             let vsz = read_u64(data_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
 
@@ -300,7 +296,7 @@ impl SSTable {
                 pos + RECORD_HEADER_LEN,
             )?[0];
             // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
-            // check ksz and vsz doesnt overflow
+
             let key_start = pos + RECORD_HEADER_LEN;
 
             let val_end = key_start
@@ -328,10 +324,9 @@ impl SSTable {
             }
 
             let val_start = key_start + ksz; // if val_end is safe then this is safe(no overflow)
-            let curr_key = read_range(&data_buffer, key_start, val_start)?;
+            let curr_key = read_range(data_buffer, key_start, val_start)?;
             // let curr_key = &data_buffer[key_start..val_start];
-            let value = read_range(&data_buffer, val_start, val_end)?;
-            // let value: &[u8] = &data_buffer[val_start..val_end];
+            let value = read_range(data_buffer, val_start, val_end)?;
 
             match curr_key.cmp(key) {
                 CmpOrdering::Less => {
@@ -661,18 +656,6 @@ mod tests {
             .unwrap();
         let file_len = f.metadata().unwrap().len();
 
-        // let mut footer_crc = [0u8; 4];
-        // f.read_exact_at(
-        //     &mut footer_crc,
-        //     file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
-        // )
-        // .unwrap();
-        // footer_crc[2] ^= 0x01;
-        // f.write_all_at(
-        //     &footer_crc,
-        //     file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,
-        // )
-        // .unwrap();
         flip_bit_at(
             &path_to_sst,
             file_len - (FOOTER_LEN - FOOTER_SPARSE_CRC_START) as u64,

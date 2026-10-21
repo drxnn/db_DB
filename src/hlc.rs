@@ -14,8 +14,6 @@ pub struct Hlc {
 
 impl Hlc {
     pub fn new() -> Self {
-        // we always create a new one for now, but in reality, we only create a new one on first boot, then we check the last most recent
-        // timestmap in the database and we check if we need a new timestamp or we use the last one + counter goes up
         Self {
             hlc: AtomicU64::new(new_timestamp() << NUM_OF_BITS_FOR_COUNTER),
         } // counter starts at 0 here

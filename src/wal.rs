@@ -113,9 +113,7 @@ impl WAL {
                             self.last_sync = Instant::now()
                         }
                     }
-                    SyncConfig::None => {
-                        // yuhu
-                    }
+                    SyncConfig::None => {}
                 }
 
                 Ok(())

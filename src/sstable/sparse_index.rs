@@ -32,8 +32,7 @@ impl SparseIndex {
         let mut out = Vec::new();
         // I am parsing this layout: ksz(8) | key(of size: ksz) | offset(8) | datablock_sz(8)
         // to essentially => key | offset | datablock_sz (this lives in memory, the sparseIndex needs key to binary search. meanwhile the sparseIndex in the metadatafooter does need the key size)
-        // TODO:
-        // Have caller
+
         let mut current = 0;
         while current < b.len() {
             let ksz = read_u64(b, current)?;

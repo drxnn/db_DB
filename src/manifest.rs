@@ -67,7 +67,7 @@ impl ManifestState {
         while offset < bytes.len() {
             let byte_to_deserialize = &bytes[offset..];
             if byte_to_deserialize.len() < MANIFEST_LEN_PREFIX {
-                break; // 
+                break;
             }
 
             let length = read_u64(byte_to_deserialize, 0)? as usize;
@@ -165,7 +165,6 @@ impl Manifest {
     // if None, open a completely new Manifest
     pub fn open(dir: &Path) -> Result<Option<Manifest>> {
         // checks whether we already have a manifest in the directory, if yes, replay it into memory
-        // if no start return None -> start new
         let path = dir.join(MANIFEST_FILE_NAME);
         let bytes = match fs::read(dir.join(MANIFEST_FILE_NAME)) {
             Ok(bytes) => bytes,
@@ -189,7 +188,6 @@ impl Manifest {
     fn write_snapshot(dir: &Path, state: &ManifestState) -> Result<(u64, File)> {
         // writes all the add_file tags to ManifestState to a tmp file, then the min_wal_id
         // then atomically rename and sync
-        //
 
         let tmp = dir.join(MANIFEST_TMP_FILE_NAME);
         let mut f = OpenOptions::new()
@@ -241,10 +239,8 @@ impl Manifest {
     }
     pub fn remove_obsolete_files(&self) {
         // cleans up the directory from unaccounted for files
-        // call during KVEngine::open
     }
 
-    // fn replay_state(bytes: &[u8]) -> ManifestState {}
     pub fn edit_and_append(&mut self, edit: &ManifestEdit) -> Result<()> {
         if self.read_only {
             return Err(DbError::ManifestError(
@@ -291,7 +287,6 @@ impl Manifest {
             payload.extend_from_slice(&wal.to_le_bytes());
         }
 
-        // get crc
         let crc32 = CRC32.compute_crc_data_block(&payload);
         let mut record: Vec<u8> = Vec::with_capacity(payload.len() + MANIFEST_RECORD_OVERHEAD);
         record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -299,7 +294,7 @@ impl Manifest {
         record.extend_from_slice(&crc32.to_le_bytes());
 
         record
-    } // takes a record and writes in in bytes
+    }
     pub fn deserialize_record(bytes: &[u8], path: &Path) -> Result<(ManifestEdit, usize)> {
         // so we read a record: length | payload | crc and return an edit so we can build state
 

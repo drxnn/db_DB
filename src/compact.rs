@@ -589,15 +589,7 @@ impl CompactionJob {
         let min_k = first.0.entry.key.clone();
 
         let mut sst_finalizer: Option<SstFinalizer> = None;
-        // let mut sst_finalizer = SstFinalizer::new(
-        //     &data_dir,
-        //     min_k,
-        //     &hlc,
-        //     compaction_outcome.level_for_output_sst,
-        //     max_sst_size,
-        // )?;
 
-        // compaction_outcome.final_sst_files.push(sst_finalizer.id);
         let mut last_k_written: Option<Vec<u8>> = None;
         let is_bottom_level =
             compaction_outcome.level_for_output_sst as usize == SST_LEVEL_COUNT - 1;
@@ -1069,20 +1061,3 @@ mod tests {
         );
     }
 }
-/*
-
-
-
-TODOs:
-TODO: if we are compacting and the output is the last level, deletes can be dropped completely
-NOT DONE YET: Handle all errors
-NOT DONE YET: Perform compaction using multiple threads, split work into subCompactionJob where each thread works on specific slices of the input files
-NOT DONE YET: need pickFilesForCompaction function(before we do this, we should separate directories into L0, L1, L2, L3 etc)
-NOT DONE YET: needs pickSubSlicesOfFilesForCompaction // picks ranges(of each file) for each thread to work on.
-qNOT DONE YET Ensure output files have no overlapping keys, this is easy since thread will work from min range of file1 to max range of file
-(somehwat done): Modularize the code
-(somewhat done)Extract some duplicate functionality into their own functions
-NOT DONE YET(Important): If we are at the bottom level of ssts, deleted records do not have to be pushed to the final merged_file, instead they are really deleted.
-NOT DONE YET: Compress bytes. check lz4 library for that
-
-*/

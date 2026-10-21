@@ -12,8 +12,6 @@ pub struct SsTableDataBlock {
 
 impl SsTableDataBlock {
     pub fn new(s_key: &[u8]) -> Self {
-        // creates SsTableDataBlock
-
         Self {
             bytes: Cursor::new(Vec::new()),
             size: 0,
@@ -22,7 +20,7 @@ impl SsTableDataBlock {
     }
     pub fn append_to_block(&mut self, entry: &[u8]) {
         self.bytes.get_mut().extend_from_slice(entry);
-        // self.bytes.extend_from_slice(entry);
+
         self.size += entry.len();
     }
 
@@ -50,11 +48,9 @@ impl SsTableDataBlock {
     pub fn grab_max_key_from_data_block(&mut self) -> Result<Vec<u8>> {
         let mut pos = 0;
 
-        let mut curr_max: Option<&[u8]> = None; // put in some then unwrap at the end or err
+        let mut curr_max: Option<&[u8]> = None;
 
         while pos < self.size {
-            // when it throws eof, we have reached the end
-
             let k_size = read_u64(self.bytes.get_ref(), RECORD_KSZ_OFFSET + pos)? as usize;
 
             let v_size = read_u64(self.bytes.get_ref(), pos + RECORD_VSZ_OFFSET)? as usize;
