@@ -63,7 +63,6 @@ fn main() {
 
         latencies.time_op(|| stalls += put_through_stalls(&mut db, &k, &value));
         if last_report.elapsed() >= REPORT_EVERY {
-            // print a format like: wrote (num of records) in (num of seconds), (num_of_MiB/per )
             let ops_per_sec = (n - num_of_records_written_in_last_report) as f64
                 / last_report.elapsed().as_secs_f64();
 
