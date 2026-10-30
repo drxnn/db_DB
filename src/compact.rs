@@ -19,8 +19,9 @@ use std::{
 use crate::errors::CompactionErr::{self};
 
 use crate::constants::{
-    BLOOM_BITS_PER_KEY, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
-    SST_LEVEL_COUNT, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
+    BLOOM_BITS_PER_KEY, BUFFER_CAPACITY, COMPACTION_READ_BUFFER_LEN, CRC_LEN,
+    DATA_BLOCK_MAX_BYTES_SIZE, SST_LEVEL_COUNT, TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE,
+    U64_LEN,
 };
 use crate::errors::CrcType;
 use crate::helpers::{
@@ -69,7 +70,7 @@ impl SstFinalizer {
         //
         let id: u64 = hlc.tick();
         let (file, final_file) = create_new_data_file(dir, id)?;
-        let writer = BufWriter::new(file);
+        let writer = BufWriter::with_capacity(BUFFER_CAPACITY, file);
         Ok(Self {
             id,
             writer,

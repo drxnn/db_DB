@@ -8,6 +8,7 @@ pub const TEST_MAX_SST_SIZE: u64 = 160 * 1024;
 pub const MAX_WAIT_TIME_FOR_WRITE_IF_STALLED_IN_MS: u64 = 2048;
 
 pub const COMPACTION_READ_BUFFER_LEN: usize = 64 * 1024;
+pub const BUFFER_CAPACITY: usize = (1 << 20);
 pub const TAG_DELETION: u8 = 2;
 pub const TAG_INSERTION: u8 = 4;
 pub const SST_LEVEL_COUNT: usize = 4;

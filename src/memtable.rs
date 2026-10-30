@@ -7,8 +7,8 @@ use std::{
 
 use crate::{
     constants::{
-        BLOOM_BITS_PER_KEY, KEY_MAX_BYTES_SIZE, RECORD_HEADER_LEN, TOMBSTONE_DELETED,
-        TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN, VALUE_MAX_BYTES_SIZE,
+        BLOOM_BITS_PER_KEY, BUFFER_CAPACITY, KEY_MAX_BYTES_SIZE, RECORD_HEADER_LEN,
+        TOMBSTONE_DELETED, TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN, VALUE_MAX_BYTES_SIZE,
     },
     errors::{DbError, InvalidMemtableInput, Result},
     helpers::{CRC32, create_new_data_file, get_hashed_key_positions},
@@ -361,7 +361,7 @@ impl AVL {
 
         (|| -> Result<Option<(File, PathBuf)>> {
             // TODO: Can also put in a function
-            let mut writer = BufWriter::new(file);
+            let mut writer = BufWriter::with_capacity(BUFFER_CAPACITY, file);
             //
             let mut data_block: Option<SsTableDataBlock> = None;
 

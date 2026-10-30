@@ -25,6 +25,10 @@ harness = false
 name = "crc"
 harness = false
 
+[[bench]]
+name = "large_write"
+harness = false
+
 
 [profile.bench]
 debug = true

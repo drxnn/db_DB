@@ -247,6 +247,7 @@ cargo test
 cargo bench --bench reads
 cargo bench --bench writes
 cargo bench --bench crc
+cargo bench --bench large_write
 ```
 
 Measured with criterion, plus an HDR histogram of every operation for the percentiles, on an Apple M4 Pro: a single thread, 16-byte keys, 100-byte values, WAL sync off (`SyncConfig::None`), data in the OS page cache. The engine sizes are scaled down (1 MiB memtable and SSTs, 4 MiB L1) so the data reaches every level (see `benches/common/mod.rs`).
@@ -272,6 +273,14 @@ Every level costs about the same: the min/max keys and bloom filters skip almost
 | mixed, 95% gets and 5% puts     | 290k ops/s | 3.00 µs | 6.00 µs |
 
 **Note:** With files this small, flushes and compactions run constantly, so write throughput is lower than it would be with larger Config sizes.
+
+**large_write:** the same kind of random-key load with production-like sizes (64 MiB memtable, 100 MiB SSTs, the default 1000 MiB L1 with each level 10× the last). It writes several GB, so instead of going through criterion it runs once, printing the throughput every 5 seconds and then the percentiles of every put. `GB=6 cargo bench --bench large_write` sets the size (the default is 2 GB):
+
+| load             | throughput | p50     | p99     | p99.9   | write stalls |
+| ---------------- | ---------- | ------- | ------- | ------- | ------------ |
+| 6 GB, 45.7M puts | 412k ops/s | 1.71 µs | 4.13 µs | 8.00 µs | 0            |
+
+Throughput stayed between ~340k and ~480k ops/s for the whole run, dipping while large compactions ran, and compaction kept up: writes never stalled.
 
 **crc:** the CRC32 of one 8 KiB block, computed one byte at a time vs 16 bytes per step: 13.8 µs vs 1.50 µs. Profiling SST reads with samply showed the checksum taking most of each read, so the engine now uses the 16-bytes-per-step version.
 
